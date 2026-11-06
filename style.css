@@ -154,3 +154,4 @@ select { max-width: 200px; font-size: 12px; }
   .nav .seg { flex-wrap: wrap; }
   .app { width: 100vw; }
 }
+.wf input.chk { width: 20px; height: 20px; min-height: 0; accent-color: var(--accent); }

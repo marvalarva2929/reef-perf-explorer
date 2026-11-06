@@ -20,16 +20,45 @@ from [LonghornSilicon/reef](https://github.com/LonghornSilicon/reef):
 - attention streams 64-key KV blocks per 16-query block and is charged the
   measured `vme_attention_block` + `attention_flash_finish` cycles;
 - pointwise kernels scale their measured tile;
-- host↔DTCM traffic is added at the measured 15.745 B/cycle. There is no DMA, so
-  it is serialized with compute.
+- every tile's inputs (weights, activations, K/V blocks) come in and its outputs
+  go out over the transfer path set by the hardware config (below).
 
-Bound labels: host transfer if it exceeds kernel time; compute if the kernel
+Bound labels: transfer (HyperRAM or host) if it exceeds kernel time; compute if the kernel
 reaches ≥60% of its engine's measured peak; DTCM if the bus is ≥60% busy;
 otherwise latency/overhead.
 
+## Hardware configs
+
+| Config | Transfer path | Source |
+|---|---|---|
+| `atlas · HyperRAM + DMA` (default) | Weights, KV cache and spilled activations in external HyperRAM; one DMA channel to the Coral core's TCMs, one outstanding transaction | [SoC architecture](https://lhs-soc.vercel.app/architecture) (`soc.yaml`) |
+| `hardware.json · host AXI` | Host writes DTCM over the 128-bit AXI slave at the measured 15.745 B/cycle, no DMA | `simulations/analysis/hardware.json` |
+
+The architecture site gives no HyperRAM bandwidth, clock or DMA-overlap rule, so
+these are What-if parameters marked unconfirmed:
+
+- **HyperRAM bandwidth:** the controller's `[10:0]` external interface matches an
+  x8 HyperBus (DQ[7:0], RWDS, CK, CS#), which moves 2 B per bus clock (DDR). The
+  bus clock defaults to the core clock: 100 MB/s, 2 B/cycle at 50 MHz. Per-transaction
+  latency is not modeled.
+- **DMA overlap:** off by default (serialized), since the site lists one outstanding
+  transaction and does not say transfers overlap compute.
+- **Clock:** 50 MHz, an open decision on the site.
+- **16×16 systolic array:** the site's integrated accelerator is assumed to be the
+  same unit as the Coral VME whose RTL cycles the estimate uses.
+
+## Models
+
+TinyStories-1M, 3M, 8M, 28M and 33M (GPT-Neo: d and layers from the
+roneneldan/TinyStories-* configs, MLP 4·d, vocab 50257, local window 256,
+alternating global/local layers, 16 heads) and GPT-2 small. Only d_head 32 and 64
+have measured attention streams; other head sizes (TinyStories-1M/3M/8M/33M:
+d_head 4, 8, 16, 48) interpolate between them and are flagged "scaled". Treat
+attention for those models as a rough estimate.
+
 ## Kernel results sets
 
-| Set | Source | GPT-Neo 28M decode @1024 / prefill 1024 |
+| Set | Source | GPT-Neo 28M decode @1024 / prefill 1024 (host AXI config) |
 |---|---|---|
 | `sim 376cd28+` (2026-10-20) | `feature/inference-engine-simulation`, RESULTS.md | 0.96 s / 2.37 min |
 | `coral-npu 5fb006c+` (2026-10-21) | `feature/coral-npu-kernels`, RESULTS.md: every integer loop vectorized | 0.76 s / 1.35 min |

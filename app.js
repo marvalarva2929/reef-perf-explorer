@@ -51,13 +51,36 @@ const TILE = {
   residual: { elems: 4096, ops: 12288, hw: 8192, out: 4096 }
 };
 
+// TinyStories (GPT-Neo) presets: d and
+// layers from the roneneldan/TinyStories-* config.json files, MLP 4·d, vocab
+// 50257, local window 256, 16 heads in every config (so d_head = d / 16).
+const tinyStories = (label, d, layers) => ({
+  label, file: label + ' (HF config)', name: label.toLowerCase(), n_head: 16, d_head: d / 16, d_model: d, d_ff: 4 * d,
+  layers, window: 256, vocab: 50257, n_ctx: 2048, alternating: true,
+  assumed: { n_head: '16 in every TinyStories config' }
+});
 const MODELS = {
-  neo: { file: 'gpt_neo_28m.json', name: 'gpt-neo-28m', n_head: 16, d_head: 32, d_model: 512, d_ff: 2048, layers: 8, window: 256, vocab: 50257, n_ctx: 2048, alternating: true, assumed: { n_head: 'assumed 16 (not in repo)' } },
-  gpt2: { file: 'model.json', name: 'gpt2-small', n_head: 12, d_head: 64, d_model: 768, d_ff: 3072, layers: 12, window: 1024, vocab: 50257, n_ctx: 1024, alternating: false, assumed: {} }
+  ts1m: tinyStories('TinyStories-1M', 64, 8),
+  ts3m: tinyStories('TinyStories-3M', 128, 8),
+  ts8m: tinyStories('TinyStories-8M', 256, 8),
+  neo: { label: 'TinyStories-28M', file: 'gpt_neo_28m.json', name: 'gpt-neo-28m', n_head: 16, d_head: 32, d_model: 512, d_ff: 2048, layers: 8, window: 256, vocab: 50257, n_ctx: 2048, alternating: true, assumed: { n_head: '16 (TinyStories HF configs)' } },
+  ts33m: tinyStories('TinyStories-33M', 768, 4),
+  gpt2: { label: 'GPT-2 small', file: 'model.json', name: 'gpt2-small', n_head: 12, d_head: 64, d_model: 768, d_ff: 3072, layers: 12, window: 1024, vocab: 50257, n_ctx: 1024, alternating: false, assumed: {} }
 };
 
+// hyperram: the SoC architecture (lhs-soc.vercel.app/architecture, soc.yaml).
+// Weights, KV cache and spilled activations live in external HyperRAM; one DMA
+// channel moves tiles between it and the Coral core's TCMs (one outstanding
+// transaction). The site gives no bandwidth: the controller's [10:0] external
+// interface matches an x8 HyperBus (DQ[7:0], RWDS, CK, CS#), which moves 2 B
+// per bus clock (DDR); the bus clock defaults to the core clock. Whether DMA
+// overlaps compute is not stated, so it defaults to serialized.
 const HARDWARE = {
-  a0: { file: 'hardware.json', name: 'coral VME a0', clock_mhz: 50, host_bw: 15.745, dbus: 16, vme_step: 84, clockConfirmed: false }
+  hyperram: {
+    label: 'atlas · HyperRAM + DMA', file: 'soc.yaml (atlas)', name: 'HyperRAM via DMA', clock_mhz: 50, dbus: 16, vme_step: 84,
+    clockConfirmed: false, ext: true, hb_mhz: 50, hb_bytes: 2, dma_overlap: 0
+  },
+  a0: { label: 'hardware.json · host AXI', file: 'hardware.json', name: 'host AXI, no DMA', clock_mhz: 50, host_bw: 15.745, dbus: 16, vme_step: 84, clockConfirmed: false, ext: false }
 };
 
 const BOUNDS = {
@@ -209,11 +232,19 @@ function run(P, HW, L, nq, ctx) {
     local: layerOps(P, HW, L, nq, ctx, P.window)
   };
   const head = [pointwise('ln_f', 'layernorm', P.d_model, P.d_model, L), matmul('lm_head', 1, P.d_model, P.vocab, HW, L)];
-  const cost = (o) => { o.hc = o.host / HW.host_bw; o.tc = o.kc + o.hc; classify(o, HW, L); };
-  let total = 0, kern = 0;
-  for (const t of ['global', 'local']) for (const o of res[t]) { cost(o); total += counts[t] * o.tc; kern += counts[t] * o.kc; }
-  for (const o of head) { cost(o); total += o.tc; kern += o.kc; }
-  return { res, head, counts, total, kern };
+  // Every tile's inputs (weights, activations, K/V blocks) come in and its
+  // outputs go out over the transfer path: host AXI writes, or the HyperRAM
+  // DMA. Serialized with the kernel unless the DMA is set to overlap.
+  const overlap = HW.ext && HW.dma_overlap;
+  const cost = (o) => {
+    o.hc = o.host / HW.host_bw;
+    o.tc = overlap ? Math.max(o.kc, o.hc) : o.kc + o.hc;
+    classify(o, HW, L);
+  };
+  let total = 0, kern = 0, moved = 0;
+  for (const t of ['global', 'local']) for (const o of res[t]) { cost(o); total += counts[t] * o.tc; kern += counts[t] * o.kc; moved += counts[t] * o.host; }
+  for (const o of head) { cost(o); total += o.tc; kern += o.kc; moved += o.host; }
+  return { res, head, counts, total, kern, moved };
 }
 
 /* -------------------------------------------------------------- format */
@@ -244,7 +275,7 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&
 /* --------------------------------------------------------------- state */
 
 const S = {
-  model: 'neo', hw: 'a0', res: 'coral', phase: 'decode', seq: 1024, layerType: 'global', sel: null,
+  model: 'neo', hw: 'hyperram', res: 'coral', phase: 'decode', seq: 1024, layerType: 'global', sel: null,
   p: {}, hwp: {}, whatif: false, zoom: null, fit: 0.9
 };
 
@@ -252,6 +283,7 @@ const S = {
   const h = new URLSearchParams(location.hash.slice(1));
   if (RESULTS[h.get('res')]) S.res = h.get('res');
   if (MODELS[h.get('model')]) S.model = h.get('model');
+  if (HARDWARE[h.get('hw')]) S.hw = h.get('hw');
   if (['prefill', 'decode'].includes(h.get('phase'))) S.phase = h.get('phase');
   if ([128, 256, 512, 1024, 2048].includes(+h.get('seq'))) S.seq = +h.get('seq');
   if (['global', 'local'].includes(h.get('layer'))) S.layerType = h.get('layer');
@@ -259,7 +291,7 @@ const S = {
 })();
 
 function writeHash() {
-  const h = new URLSearchParams({ res: S.res, model: S.model, phase: S.phase, seq: S.seq, layer: S.layerType });
+  const h = new URLSearchParams({ res: S.res, model: S.model, hw: S.hw, phase: S.phase, seq: S.seq, layer: S.layerType });
   if (S.sel) h.set('sel', S.sel);
   history.replaceState(null, '', '#' + h.toString());
 }
@@ -277,6 +309,11 @@ function resolved() {
   };
   const P = apply(BP, S.p), HW = apply(BH, S.hwp);
   if (P.d_head % 4) P.d_head = Math.max(4, Math.round(P.d_head / 4) * 4);
+  if (HW.ext) {
+    if (S.hwp.dma_overlap !== undefined) HW.dma_overlap = S.hwp.dma_overlap ? 1 : 0;
+    HW.host_bw = HW.hb_mhz * HW.hb_bytes / HW.clock_mhz; // B per core cycle
+  }
+  BOUNDS.host.label = HW.ext ? 'Memory · HyperRAM' : 'Host transfer';
   return { P, HW, BP, BH, L: RESULTS[S.res] };
 }
 
@@ -349,8 +386,11 @@ function render() {
   const sel = S.sel;
 
   // ---- nav
-  $('model-select').innerHTML = optionsHTML(MODELS, (m) => (m.file === 'model.json' ? m.name + ' (model.json)' : m.file), S.model, '<option value="__import">Import JSON…</option>');
-  $('hw-select').innerHTML = optionsHTML(HARDWARE, (h) => h.file, S.hw, '<option value="__import">Import JSON…</option>');
+  $('model-select').innerHTML = optionsHTML(MODELS, (m) => m.label || m.file, S.model, '<option value="__import">Import JSON…</option>');
+  $('model-select').title = BP.file;
+  $('hw-select').innerHTML = optionsHTML(HARDWARE, (h) => h.label || h.file, S.hw, '<option value="__import">Import JSON…</option>');
+  $('hw-select').title = BH.file;
+  const XF = HW.ext ? 'HyperRAM↔TCM' : 'Host↔DTCM';
   $('res-select').innerHTML = optionsHTML(RESULTS, (r) => r.short, S.res);
   $('res-select').title = L.note;
   $('phase-seg').innerHTML = segHTML([['prefill', 'Prefill'], ['decode', 'Decode']], S.phase, 'phase');
@@ -366,8 +406,12 @@ function render() {
     ['p', 'layers', 'Layers', 1, P.alternating ? 'alternating global / local' : 'all global'],
     ['p', 'window', 'Local window', 64, P.alternating ? 'local-attention layers' : 'unused (all global)'],
     ['p', 'vocab', 'Vocab size', 1024, 'LM head width'],
-    ['hwp', 'clock_mhz', 'Clock (MHz)', 5, BH.clockConfirmed ? 'confirmed' : 'unconfirmed · PD team'],
-    ['hwp', 'host_bw', 'Host→DTCM (B/cycle)', 0.5, 'measured · RTL bound 16'],
+    ['hwp', 'clock_mhz', 'Clock (MHz)', 5, BH.clockConfirmed ? 'confirmed' : 'unconfirmed · not in soc.yaml'],
+    ...(HW.ext ? [
+      ['hwp', 'hb_mhz', 'HyperBus clock (MHz)', 5, 'not stated · defaults to core clock'],
+      ['hwp', 'hb_bytes', 'Bytes per bus clock', 1, 'x8 DDR from [10:0] interface · derived'],
+      ['hwp', 'dma_overlap', 'DMA overlaps compute', 'bool', 'not stated · 1 outstanding txn']
+    ] : [['hwp', 'host_bw', 'Host→DTCM (B/cycle)', 0.5, 'measured · RTL bound 16']]),
     ['hwp', 'dbus', 'DTCM bus (B/cycle)', 4, 'confirmed · 128-bit LSU'],
     ['hwp', 'vme_step', 'VME cycles / step', 1, 'measured · k-sweep slope']
   ];
@@ -376,6 +420,15 @@ function render() {
     const [grp, key, label, step, note] = f;
     const baseV = grp === 'p' ? BP[key] : BH[key];
     const raw = S[grp][key];
+    if (step === 'bool') {
+      const on = raw !== undefined ? !!raw : !!baseV;
+      const isB = raw !== undefined && !!raw !== !!baseV;
+      if (isB) changed++;
+      return `<div class="wf${isB ? ' changed' : ''}">
+        <label for="f-${key}"><span>${esc(label)}</span><span class="note small muted">${esc(isB ? 'edited · file says ' + (baseV ? 'on' : 'off') : note)}</span></label>
+        <input id="f-${key}" type="checkbox" class="chk" data-grp="${grp}" data-key="${key}"${on ? ' checked' : ''}>
+      </div>`;
+    }
     const isCh = raw !== undefined && parseFloat(raw) !== baseV;
     if (isCh) changed++;
     return `<div class="wf${isCh ? ' changed' : ''}">
@@ -383,8 +436,8 @@ function render() {
       <input id="f-${key}" type="number" inputmode="decimal" step="${step}" data-grp="${grp}" data-key="${key}" value="${esc(raw !== undefined ? raw : baseV)}">
     </div>`;
   };
-  const modelFields = fields.slice(0, 7).map(fieldHTML).join('');
-  const hwFields = fields.slice(7).map(fieldHTML).join('');
+  const modelFields = fields.filter((f) => f[0] === 'p').map(fieldHTML).join('');
+  const hwFields = fields.filter((f) => f[0] === 'hwp').map(fieldHTML).join('');
   const active = document.activeElement && document.activeElement.id;
   $('whatif').hidden = !S.whatif;
   $('whatif').innerHTML = `
@@ -393,7 +446,7 @@ function render() {
       <button type="button" class="btn sm" data-act="whatif" aria-label="Close what-if">✕</button></div>
     <fieldset><legend class="eyebrow">Model · ${esc(BP.file)}</legend>${modelFields}</fieldset>
     <fieldset><legend class="eyebrow">Hardware · ${esc(BH.file)}</legend>${hwFields}</fieldset>
-    <p class="small muted" style="margin:0">Edits override the loaded files for this session. Kernel cycles stay as measured; the VME step re-costs VME tiles.</p>`;
+    <p class="small muted" style="margin:0">Edits override the loaded files for this session. Kernel cycles stay as measured on the VME RTL; the VME step re-costs VME tiles.${HW.ext ? ' HyperRAM bandwidth: ' + (HW.hb_mhz * HW.hb_bytes).toFixed(0) + ' MB/s = ' + HW.host_bw.toFixed(2) + ' B/cycle.' : ''}</p>`;
   if (active && active.startsWith('f-') && $(active)) { const el = $(active); el.focus(); }
   $('whatif-btn').setAttribute('aria-pressed', String(S.whatif));
   $('whatif-count').hidden = !changed;
@@ -440,13 +493,16 @@ function render() {
   $('sizer').style.width = Math.ceil(1500 * zoom + 420) + 'px';
   $('sizer').style.height = Math.ceil(820 * zoom + 60) + 'px';
   $('zoom-pct').textContent = Math.round(zoom * 100) + '%';
-  $('context-label').textContent = `${P.name} · ${phase}${S.phase === 'prefill' ? ' ' + seq + ' tokens' : ' @ ctx ' + seq} · ${L.short}`;
+  $('context-label').textContent = `${P.name} · ${phase}${S.phase === 'prefill' ? ' ' + seq + ' tokens' : ' @ ctx ' + seq} · ${BH.name} · ${L.short}`;
   $('legend').innerHTML = Object.values(BOUNDS).map((b) => `<span><span class="sw" style="background:${b.color}"></span>${b.label}</span>`).join('');
 
   // ---- right popups
   const scrollKeep = [...$('right').querySelectorAll('.grow')].map((e) => e.scrollTop);
   if (!sel) {
-    const mixAcc = { compute: 0, dtcm: 0, host: 0, latency: 0 };
+    const mixAcc = Object.fromEntries(Object.keys(BOUNDS).map((k) => [k, 0]));
+    const moveLine = HW.ext
+      ? `Kernel ${pct(cur.kern / cur.total)} · HyperRAM DMA ${pct(1 - cur.kern / cur.total)} of time. ${fmtB(cur.moved)} moved at ${(HW.hb_mhz * HW.hb_bytes).toFixed(0)} MB/s (${HW.host_bw.toFixed(2)} B/cycle, derived). DMA ${HW.dma_overlap ? 'overlaps compute: each block takes the longer of the two' : 'serialized with compute (overlap not stated)'}.`
+      : `Kernel time ${pct(cur.kern / cur.total)} · host↔DTCM transfer ${pct(1 - cur.kern / cur.total)} (no DMA, serialized)`;
     for (const r of rows) mixAcc[r.o.bound] += r.tot;
     const mix = Object.keys(BOUNDS).map((k) => ({ ...BOUNDS[k], w: mixAcc[k] / cur.total }));
     const hz = HW.clock_mhz * 1e6;
@@ -477,7 +533,7 @@ function render() {
             <span class="mono small muted" style="width:76px;text-align:right">${T(x.pre)}</span></button>`).join('')}
           <div class="small muted">decode @ ctx ${seq} · prefill ${seq} tokens${base ? '' : ''}</div>
         </div>
-        <div class="small muted">Kernel time ${pct(cur.kern / cur.total)} · host↔DTCM transfer ${pct(1 - cur.kern / cur.total)} (no DMA, serialized)</div>
+        <div class="small muted">${esc(moveLine)}</div>
       </section>
       <section class="popup grow" aria-label="Where the time goes">
         <div style="display:flex;align-items:baseline;gap:8px"><div class="eyebrow" style="flex-grow:1">Where the time goes · ${phase}</div><span class="mono small" style="color:var(--text-2)">${T(cur.total)}</span></div>
@@ -496,22 +552,24 @@ function render() {
     const reasons = {
       compute: `Runs at ${pct(o.cu)} of the measured ${o.engine} peak (${o.peak.toFixed(1)} ops/cycle). Only more ${o.engine} throughput or fewer ops moves it.`,
       dtcm: `The DTCM bus is ${pct(o.du)} busy at ${HW.dbus} B/cycle. A wider bus or better reuse moves it.`,
-      host: `Host↔DTCM transfer (${fmtC(o.hc)} cycles) is longer than the kernel (${fmtC(o.kc)}). No DMA, so it is not overlapped.`,
+      host: HW.ext
+        ? `Moving ${fmtB(o.host)} over the HyperRAM DMA (${fmtC(o.hc)} cycles at ${HW.host_bw.toFixed(2)} B/cycle) takes longer than the kernel (${fmtC(o.kc)}). ${HW.dma_overlap ? 'With overlap the transfer sets the time.' : 'It is serialized with the kernel.'} More HyperRAM bandwidth or tile reuse moves it.`
+        : `Host↔DTCM transfer (${fmtC(o.hc)} cycles) is longer than the kernel (${fmtC(o.kc)}). No DMA, so it is not overlapped.`,
       latency: `Neither roof is close: ${pct(o.cu)} of ${o.engine} peak, ${pct(o.du)} of DTCM bandwidth. Time goes to loop overhead, scalar work and load-use stalls — a kernel-side fix.`
     };
     const stats = [
       [inHead ? 'Time' : 'Time / layer', T(o.tc)],
       [`In model (×${n})`, `${T(o.tc * n)} · ${pct(o.tc * n / cur.total)}`],
       ['Shape', o.shape], ['Tiles / launches', fmtInt(o.tiles)],
-      ['Kernel cycles', fmtC(o.kc)], ['Host↔DTCM cycles', fmtC(o.hc)],
-      ['DTCM↔core bytes', fmtB(o.dtcm)], ['Host↔DTCM bytes', fmtB(o.host)],
+      ['Kernel cycles', fmtC(o.kc)], [XF + ' cycles', fmtC(o.hc)],
+      ['DTCM↔core bytes', fmtB(o.dtcm)], [XF + ' bytes', fmtB(o.host)],
       ['Ops (2·MAC)', fmtC(o.ops)], ['Attained', (o.ops / o.kc).toFixed(2) + ' ops/cyc'],
       ['Intensity', (o.ops / o.dtcm).toFixed(2) + ' ops/B'], ['Engine', `${o.engine} · peak ${o.peak.toFixed(1)}`]
     ];
     const meters = [
       [o.engine + ' compute peak', Math.min(1, o.cu), BOUNDS.compute.color],
       ['DTCM bus bandwidth', Math.min(1, o.du), BOUNDS.dtcm.color],
-      ['Host transfer share of block time', o.hu, BOUNDS.host.color]
+      [(HW.ext ? 'HyperRAM DMA' : 'Host transfer') + ' share of block time', o.hu, BOUNDS.host.color]
     ];
     // same block across result sets
     const across = Object.keys(RESULTS).map((k) => {
@@ -563,6 +621,7 @@ function render() {
           ${across.map((a) => `<div style="display:flex;flex-direction:column;gap:3px"><div class="small" style="display:flex;justify-content:space-between;${a.k === S.res ? 'color:var(--text)' : 'color:var(--text-2)'}"><span class="mono">${esc(a.short)}${a.k === S.res ? ' ·  current' : ''}</span><span class="mono">${T(a.tc)}</span></div><span class="track"><span style="width:${(a.tc / maxA * 100).toFixed(1)}%;background:${BOUNDS[a.bound].color}"></span></span></div>`).join('')}
         </div>
         <div class="src"><div class="small" style="font-weight:600">Measured source · ${esc(L.short)}</div>
+          ${o.engine === 'VME' ? '<div class="small muted">VME cycles stand in for the 16×16 systolic array (assumed the same unit).</div>' : ''}
           <div class="mono small" style="color:var(--text-2)">${esc(o.src)}</div>
           ${o.flag ? `<div class="flag">${esc(o.flagText)}</div>` : ''}</div>
       </section>`;
@@ -619,7 +678,7 @@ document.addEventListener('keydown', (e) => {
 
 document.addEventListener('input', (e) => {
   const t = e.target;
-  if (t.dataset && t.dataset.grp) { S[t.dataset.grp][t.dataset.key] = t.value; render(); }
+  if (t.dataset && t.dataset.grp) { S[t.dataset.grp][t.dataset.key] = t.type === 'checkbox' ? (t.checked ? 1 : 0) : t.value; render(); }
 });
 
 $('res-select').addEventListener('change', (e) => { S.res = e.target.value; render(); });
@@ -668,6 +727,19 @@ function parseHW(j, file) {
     }
     return null;
   };
+  const ext = g('hyperram.bus_mhz', 'memory.hyperram.bus_mhz', 'hyperram.mb_per_s', 'memory.hyperram.mb_per_s');
+  if (ext) {
+    const mbs = g('hyperram.mb_per_s', 'memory.hyperram.mb_per_s');
+    const busMhz = g('hyperram.bus_mhz', 'memory.hyperram.bus_mhz') || (g('clock_mhz') || 50);
+    const out = {
+      file, label: String(j.name || file), name: 'HyperRAM via DMA', ext: true,
+      clock_mhz: g('clock_mhz') || 50, dbus: g('dbus_bytes_per_cycle', 'memory.dtcm.bus_bytes_per_cycle') || 16,
+      vme_step: g('vme_cycles_per_matmul_step', 'engines.vme.cycles_per_step') || 84,
+      hb_mhz: busMhz, hb_bytes: mbs ? mbs / busMhz : (g('hyperram.bytes_per_clock', 'memory.hyperram.bytes_per_clock') || 2),
+      dma_overlap: (j.dma && num(j.dma.overlap)) ? 1 : 0, clockConfirmed: !!(j.clock_mhz && j.clock_mhz.confirmed)
+    };
+    return out;
+  }
   const out = {
     file, name: String(j.name || file.replace(/\.json$/, '')),
     clock_mhz: g('clock_mhz'),
