@@ -600,7 +600,7 @@ function render() {
 
   const zoom = S.zoom || S.fit;
   $('world').style.transform = `scale(${zoom})`;
-  $('sizer').style.width = Math.ceil(1500 * zoom + 420) + 'px';
+  $('sizer').style.width = Math.ceil(1500 * zoom + 510) + 'px';
   $('sizer').style.height = Math.ceil(820 * zoom + 60) + 'px';
   $('zoom-pct').textContent = Math.round(zoom * 100) + '%';
   $('context-label').textContent = `${P.name} · ${phase}${S.phase === 'prefill' ? ' ' + seq + ' tokens' : ' @ ctx ' + seq} · ${BH.name} · ${L.short}`;
@@ -773,7 +773,7 @@ function render() {
     const m = o.m;
     const share = m.total_cycles * n / cur.total;
     const bo = base && (base.head.find((x) => x.id === sel) || base.res[lt].find((x) => x.id === sel));
-    const BAR_W = 382;
+    const BAR_W = 462;
     const timeBar = (mm, tag, scale) => {
       const segs = mm.segments, sum = segSum(segs), wf = sum / scale;
       const shown = segOrder.filter((id) => segs[id] > 0);
@@ -845,7 +845,7 @@ function toast(msg) {
 function fitZoom() {
   const st = document.querySelector('.stage').getBoundingClientRect();
   const narrow = st.width < 760;
-  const f = Math.min(1.1, (st.width - (narrow ? 32 : 420)) / 1500, (st.height - (narrow ? st.height * 0.46 + 40 : 40)) / 820);
+  const f = Math.min(1.1, (st.width - (narrow ? 32 : 510)) / 1500, (st.height - (narrow ? st.height * 0.46 + 40 : 40)) / 820);
   S.fit = Math.max(0.35, Math.round(f * 100) / 100);
 }
 
