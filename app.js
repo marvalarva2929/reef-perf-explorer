@@ -258,10 +258,8 @@ function classify(o, HW, L) {
   o.bound = Object.keys(o.busy).reduce((a, b) => (o.busy[b] > o.busy[a] ? b : a));
 }
 
-// Per-module record for the side panel. Sequential timing:
-// total_cycles = sum of resource cycles + overhead.
-const dataWarned = new Set();
-function moduleData(o, HW, L) {
+// Per-module record for the side panel. segments sum to total_cycles.
+function moduleData(o, HW, L, overlap) {
   const eng = o.engine === 'VME' ? 'vme' : 'rvv', oth = eng === 'vme' ? 'rvv' : 'vme';
   const other = o.otherUnknown ? null : 0, bytes = o.reqBytes != null ? o.reqBytes : null;
   const used = { [eng]: o.usedOps, [oth]: other, dtcm: o.dtcm, xfer: o.host };
@@ -283,17 +281,14 @@ function moduleData(o, HW, L) {
     cycles[id] = active_cycles[id] != null ? active_cycles[id] : modeled;
     min_cycles[id] = id === 'dtcm' ? dtcm.min_cycles : (required[id] == null ? null : required[id] / peak_rate[id]);
   }
-  const segments = Object.fromEntries(RESOURCES.map(({ id }) => [id, cycles[id] || 0]));
-  const busy = Object.values(segments).reduce((a, b) => a + b, 0);
-  const over = o.tc - busy;
-  if (over < 0) {
-    const key = `${o.id}|${o.shape}|${L.short}|${HW.name}`;
-    if (!dataWarned.has(key)) {
-      dataWarned.add(key);
-      console.warn(`data error: ${o.id} ${o.shape} resource cycles ${Math.round(busy)} > total_cycles ${Math.round(o.tc)}`);
-    }
-  }
-  segments.overhead = Math.max(0, over);
+  // A serial DMA gets its full time. On-chip resources overlap, so only the
+  // largest is charged, capped at kernel time; the rest of the kernel is overhead.
+  const segments = { vme: 0, rvv: 0, dtcm: 0, xfer: 0, overhead: 0 };
+  const pool = overlap ? ['vme', 'rvv', 'dtcm', 'xfer'] : ['vme', 'rvv', 'dtcm'];
+  const top = pool.reduce((x, y) => ((cycles[y] || 0) > (cycles[x] || 0) ? y : x));
+  if (!overlap) segments.xfer = o.hc;
+  segments[top] = Math.min(overlap ? o.tc : o.kc, cycles[top] || 0);
+  segments.overhead = o.tc - RESOURCES.reduce((a, r) => a + segments[r.id], 0);
   return { total_cycles: o.tc, shape: o.shape, segments, peak_rate, required, used, active_cycles, dtcm, cycles, min_cycles };
 }
 
@@ -314,7 +309,7 @@ function run(P, HW, L, nq, ctx) {
     o.hc = o.host / HW.host_bw;
     o.tc = overlap ? Math.max(o.kc, o.hc) : o.kc + o.hc;
     classify(o, HW, L);
-    o.m = moduleData(o, HW, L);
+    o.m = moduleData(o, HW, L, overlap);
   };
   let total = 0, kern = 0, moved = 0;
   for (const t of ['global', 'local']) for (const o of res[t]) { cost(o); total += counts[t] * o.tc; kern += counts[t] * o.kc; moved += counts[t] * o.host; }
