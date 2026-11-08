@@ -34,6 +34,9 @@ on-chip resource with the largest used ÷ peak gets that many cycles, and the re
 of the kernel is overhead. Required amounts come from the shape for matmuls and
 attention ops; anything not derivable shows "—".
 
+The roofline's y axis is used ops over total cycles, the same value as Achieved in
+the table. Its x axis and memory roof follow the DTCM / DMA toggle.
+
 ## Hardware configs
 
 | Config | Transfer path | Source |

@@ -358,7 +358,7 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&
 
 const S = {
   model: 'neo', hw: 'hyperram', res: 'transposed', phase: 'decode', seq: 1024, layerType: 'global', sel: null,
-  p: {}, hwp: {}, whatif: false, zoom: null, fit: 0.9, bars: 'abs', grid: 'achieved'
+  p: {}, hwp: {}, whatif: false, zoom: null, fit: 0.9, bars: 'abs', grid: 'achieved', roof: 'xfer'
 };
 
 (function readHash() {
@@ -623,6 +623,48 @@ function render() {
       <text x="${cx}" y="${cy + 2}" text-anchor="middle" class="d-t" style="font-size:${(r * 0.36).toFixed(1)}px">${f3(total)}</text>${compact ? '' : `<text x="${cx}" y="${cy + r * 0.36}" text-anchor="middle" class="d-v">cycles</text>`}</svg>`;
   }
 
+  // Roofline: y matches the table's Achieved (used ops over total cycles); x and
+  // the memory roof come from the selected memory level.
+  function roofline() {
+    const W = 386, H = 214, L0 = 36, R0 = W - 6, T0 = 8, B0 = H - 30;
+    const res = (id) => RESOURCES.find((r) => r.id === id);
+    const mem = res(S.roof), peak = cur.head[0].m.peak_rate;
+    const B = peak[mem.id], pV = peak.vme, pR = peak.rvv;
+    const lg = (v) => Math.log10(Math.max(1e-6, v));
+    const X = (v) => Math.min(R0, Math.max(L0, L0 + (lg(v) + 2) / 5 * (R0 - L0)));
+    const Y = (v) => Math.min(B0, Math.max(T0, B0 - (lg(v) + 2) / 4 * (B0 - T0)));
+    const xt = [0.01, 0.1, 1, 10, 100, 1000], yt = [100, 10, 1, 0.1, 0.01];
+    const xl = (v) => (v >= 1000 ? '1K' : String(v));
+    const x0 = Math.max(0.01, 0.01 / B);
+    // Modules within a few px share one dot; rows are sorted, so the first is the largest.
+    const groups = [];
+    for (const r of rows) {
+      const m = r.o.m, eng = r.o.engine === 'VME' ? 'vme' : 'rvv';
+      const ops = m.used[eng], x = ops / m.used[mem.id], y = ops / m.total_cycles;
+      const px = X(x), py = Y(y), on = !!sel && r.key === sel && (!r.t || r.t === lt);
+      const name = r.key === 'attention' ? 'attention ' + r.t : r.key;
+      const g = groups.find((d) => d.eng === eng && Math.hypot(d.px - px, d.py - py) < 4);
+      if (g) { g.names.push(name); if (on) { g.on = true; g.r = r; } }
+      else groups.push({ eng, px, py, x, y, on, r, names: [name] });
+    }
+    const dots = groups.sort((a, b) => a.on - b.on).map((g) =>
+      `<button type="button" class="rp${g.on ? ' on' : ''}${sel && !g.on ? ' dim' : ''}" data-sel="${g.r.key}" data-layer-set="${g.r.t || lt}" aria-label="${esc(g.names.join(', '))}" title="${esc(g.names.join(', '))} · ${g.x.toPrecision(4)} ops/B · ${g.y.toPrecision(4)} ops/cyc" style="left:${(g.px / W * 100).toFixed(2)}%;top:${(g.py / H * 100).toFixed(2)}%;background:${res(g.eng).color}"></button>`).join('');
+    return `<div class="sec-row"><div class="sec">Roofline</div><div class="seg mini">${segHTML(['dtcm', 'xfer'].map((id) => [id, res(id).short(HW)]), S.roof, 'roof')}</div></div>
+      <div class="roofc"><svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="Roofline">
+        <g stroke="var(--line)">${xt.map((v) => `<line x1="${X(v)}" y1="${T0}" x2="${X(v)}" y2="${B0}"/>`).join('')}${yt.map((v) => `<line x1="${L0}" y1="${Y(v)}" x2="${R0}" y2="${Y(v)}"/>`).join('')}</g>
+        ${xt.map((v, i) => `<text x="${X(v)}" y="${B0 + 13}" text-anchor="${i === 5 ? 'end' : 'middle'}" class="d-v">${xl(v)}</text>`).join('')}
+        ${yt.map((v) => `<text x="${L0 - 5}" y="${Y(v) + 4}" text-anchor="end" class="d-v">${v}</text>`).join('')}
+        <text x="${(L0 + R0) / 2}" y="${H - 3}" text-anchor="middle" class="d-v">ops / ${mem.short(HW)} byte</text>
+        <text x="${L0 + 4}" y="${T0 + 11}" class="d-v">ops/cyc</text>
+        <path d="M${X(x0)} ${Y(B * x0)} L${X(pV / B)} ${Y(pV)}" fill="none" stroke="${mem.color}" stroke-width="1.6"/>
+        <path d="M${X(pV / B)} ${Y(pV)} L${R0} ${Y(pV)}" fill="none" stroke="${res('vme').color}" stroke-width="1.6"/>
+        <path d="M${X(pR / B)} ${Y(pR)} L${R0} ${Y(pR)}" fill="none" stroke="${res('rvv').color}" stroke-width="1.4" stroke-dasharray="5 3"/>
+        <text x="${R0 - 2}" y="${Y(pV) + 12}" text-anchor="end" class="d-n" fill="${res('vme').color}">VME ${f3(pV)}</text>
+        <text x="${R0 - 2}" y="${Y(pR) - 4}" text-anchor="end" class="d-n" fill="${res('rvv').color}">RVV ${f3(pR)}</text>
+        <text x="${X(0.1 / B) + 10}" y="${Y(0.1) + 15}" class="d-n" fill="${mem.color}">${mem.short(HW)} ${f3(B)} B/cyc</text>
+      </svg>${dots}</div>`;
+  }
+
   if (!sel) {
     const sumSegs = (list) => {
       const out = Object.fromEntries(segOrder.map((id) => [id, 0]));
@@ -679,6 +721,7 @@ function render() {
         ${base
           ? `<div class="two">${donut(baseSegs, base.total, 190, 160, 30, true)}${donut(segs, cur.total, 190, 160, 30, true)}</div>`
           : donut(segs, cur.total, 380, 190, 56)}
+        ${roofline()}
         <div class="sec-row"><div class="sec">Modules by time</div><div class="seg mini">${segHTML([['abs', 'Cycles'], ['pct', '100%']], S.bars, 'bars')}</div></div>
         <div class="mods">${rows.map((r) => {
           const w = S.bars === 'abs' ? r.tot / scale * 100 : 100;
@@ -729,6 +772,7 @@ function render() {
           <div class="ph-top"><span class="ph-big">${bo ? f3(bo.m.total_cycles) + ' → ' : ''}${f3(m.total_cycles)} cycles</span><span class="ph-time">${t3(m.total_cycles, HW)}</span></div>
           <div class="ph-sub">${esc(m.shape)} · ×${n} · ${p2(share)} of model${o.flag ? ' · scaled' : ''}</div>
         </div>
+        ${roofline()}
         <div>
           <div class="tbar">${barSegs(m.segments, m.total_cycles)}</div>
           <div class="tlabels">${shown.map((id) => `<span style="width:${(m.segments[id] / m.total_cycles * 100).toFixed(3)}%">${fits(id) ? label(id) : ''}</span>`).join('')}</div>
@@ -766,7 +810,8 @@ document.addEventListener('click', (e) => {
     return;
   }
   const d = b.dataset;
-  if (d.bars) S.bars = d.bars;
+  if (d.roof) S.roof = d.roof;
+  else if (d.bars) S.bars = d.bars;
   else if (d.grid) S.grid = d.grid;
   else if (d.phase) S.phase = d.phase;
   else if (d.seq) S.seq = +d.seq;
