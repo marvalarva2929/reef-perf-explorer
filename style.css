@@ -201,12 +201,12 @@ button.mod:hover, button.ug:hover { background: var(--control); }
 .ab { flex: 1 1 auto; max-width: 44px; height: 5px; background: var(--track); border-radius: 2px; overflow: hidden; }
 .ab span { display: block; height: 100%; }
 @media (min-width: 761px) {
-  .nav { flex-wrap: nowrap; padding: 4px 10px; gap: 10px; }
-  .nav .field { gap: 5px; min-width: 0; flex: 0 1 auto; }
-  .nav .field label, .nav #seq-label { font-size: 11px; white-space: nowrap; }
-  .nav select { height: 24px; min-height: 24px; min-width: 0; width: 100%; max-width: 168px; padding: 0 2px 0 4px; border-radius: 3px; font-size: 11px; }
-  .nav .btn { height: 24px; min-height: 24px; padding: 0 7px; border-radius: 3px; font-size: 11px; flex-shrink: 0; white-space: nowrap; }
-  .nav .pill { font-size: 10px; padding: 0 4px; }
-  .nav .seg { padding: 1px; gap: 1px; border-radius: 3px; flex-shrink: 0; }
-  .nav .seg button, .nav #seq-seg button, .nav #phase-seg button { min-width: 0; min-height: 20px; height: 20px; padding: 0 6px; border-radius: 2px; font-size: 11px; }
+  .nav { flex-wrap: nowrap; align-items: center; padding: 7px 16px; gap: 16px; }
+  .nav .field { display: flex; align-items: center; gap: 7px; min-width: 0; flex: 0 1 auto; }
+  .nav .field label, .nav #seq-label { font-size: 12px; line-height: 28px; white-space: nowrap; }
+  .nav select { appearance: none; -webkit-appearance: none; box-sizing: border-box; flex: 0 1 auto; width: auto; height: 28px; min-height: 28px; min-width: 0; max-width: none; padding: 0 24px 0 9px; border-radius: 4px; font-size: 12px; line-height: 26px; background: var(--control) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23dde2e9' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 8px center; }
+  .nav .btn { justify-content: center; height: 28px; min-height: 28px; padding: 0 10px; border-radius: 4px; font-size: 12px; line-height: 1; flex-shrink: 0; white-space: nowrap; }
+  .nav .pill { font-size: 10px; line-height: 14px; padding: 0 4px; }
+  .nav .seg { box-sizing: border-box; height: 28px; align-items: stretch; padding: 2px; gap: 2px; border-radius: 4px; flex-shrink: 0; }
+  .nav .seg button, .nav #seq-seg button, .nav #phase-seg button { display: inline-flex; align-items: center; justify-content: center; min-width: 0; min-height: 0; height: auto; padding: 0 9px; border-radius: 3px; font-size: 12px; line-height: 1; }
 }
