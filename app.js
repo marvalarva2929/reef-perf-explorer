@@ -90,9 +90,9 @@ const MODELS = {
 const HARDWARE = {
   hyperram: {
     label: 'atlas · HyperRAM + DMA', file: 'soc.yaml (atlas)', name: 'HyperRAM via DMA', clock_mhz: 50, dbus: 16, vme_step: 84,
-    clockConfirmed: false, ext: true, hb_mhz: 50, hb_bytes: 2, dma_overlap: 0
+    clockConfirmed: false, dtcm_c: 3.1, ext: true, hb_mhz: 50, hb_bytes: 2, dma_overlap: 0
   },
-  a0: { label: 'hardware.json · host AXI', file: 'hardware.json', name: 'host AXI, no DMA', clock_mhz: 50, host_bw: 15.745, dbus: 16, vme_step: 84, clockConfirmed: false, ext: false }
+  a0: { label: 'hardware.json · host AXI', file: 'hardware.json', name: 'host AXI, no DMA', clock_mhz: 50, host_bw: 15.745, dbus: 16, vme_step: 84, clockConfirmed: false, dtcm_c: 3.1, ext: false }
 };
 
 // Side-panel resource list. Every panel view reads this; order is display order.
@@ -103,6 +103,9 @@ const RESOURCES = [
   { id: 'xfer', name: (HW) => (HW.ext ? 'HyperRAM DMA' : 'Host AXI'), short: (HW) => (HW.ext ? 'DMA' : 'Host'), unit: 'bytes', rate: 'B/cyc', color: '#e07b3c' }
 ];
 const OVERHEAD = { id: 'overhead', color: '#aab3c0' };
+// vtmms-only loop, operands loaded once (DECODE_GEMV_PROPOSAL): cycles per 16x16x4 step.
+const VME_ARRAY_STEP = 6.9;
+const DTCM_WIDEST = 16;
 
 const BOUNDS = {
   compute: { label: 'Compute', color: '#6b98ff' },
@@ -137,12 +140,15 @@ function matmul(id, n, k, m, HW, L) {
   const tn = gemm ? 16 : 1, tk = 512, tm = vme ? 16 : 32;
   const chunks = [];
   for (let k0 = 0; k0 < k; k0 += tk) chunks.push(Math.min(tk, k - k0));
-  let kc = 0, dt = 0, host = 0;
+  let kc = 0, dt = 0, host = 0, acc = 0;
   const at = cdiv(n, tn), mt = cdiv(m, tm);
   for (const c of chunks) {
     kc += vme ? over + HW.vme_step * c / 4 : L.rvvTile * c / tk;
     dt += vme ? (c / 4) * 128 + tn * tm * 4 : tn * cdiv(tm, 16) * c * 17 + tn * tm * 4;
     host += tn * c + mt * (c * tm + tn * tm * 4);
+    // VME step: 8 contiguous 16 B loads transposed, 20 accesses (6.4 B each) otherwise.
+    // RVV: one A byte and one 16 B B load per k. Results drain at 16 B.
+    acc += (vme ? (c / 4) * (L.vmeStep ? 8 : 20) : tn * cdiv(tm, 16) * c * 2) + tn * tm * 4 / DTCM_WIDEST;
   }
   const src = gemv
     ? `mtx_gemv_int8 1×512×16 = ${fmtInt(over + HW.vme_step * 128)} cyc · A transposed`
@@ -155,7 +161,7 @@ function matmul(id, n, k, m, HW, L) {
     host: at * host, tiles: at * mt * chunks.length, src, flag: false,
     // The array computes all 16 rows on a GEMV tile; only one is useful.
     usedOps: 2 * at * mt * chunks.reduce((a, c) => a + (gemv ? 16 : tn) * c * tm, 0),
-    reqOps: 2 * n * k * m, reqBytes: n * k + k * m + 4 * n * m
+    reqOps: 2 * n * k * m, reqBytes: n * k + k * m + 4 * n * m, dtcmAcc: at * mt * acc
   };
 }
 
@@ -252,23 +258,43 @@ function classify(o, HW, L) {
   o.bound = Object.keys(o.busy).reduce((a, b) => (o.busy[b] > o.busy[a] ? b : a));
 }
 
-// Per-module record for the side panel. segments sum to total_cycles.
-function moduleData(o, HW, L, overlap) {
+// Per-module record for the side panel. Sequential timing:
+// total_cycles = sum of resource cycles + overhead.
+const dataWarned = new Set();
+function moduleData(o, HW, L) {
   const eng = o.engine === 'VME' ? 'vme' : 'rvv', oth = eng === 'vme' ? 'rvv' : 'vme';
   const other = o.otherUnknown ? null : 0, bytes = o.reqBytes != null ? o.reqBytes : null;
   const used = { [eng]: o.usedOps, [oth]: other, dtcm: o.dtcm, xfer: o.host };
   const required = { [eng]: o.reqOps != null ? o.reqOps : null, [oth]: other, dtcm: bytes, xfer: bytes };
-  const peak_rate = { vme: 2048 / HW.vme_step, rvv: 32768 / L.rvvTile, dtcm: HW.dbus, xfer: HW.host_bw };
-  const segments = { vme: 0, rvv: 0, dtcm: 0, xfer: 0, overhead: 0 };
-  const pool = overlap ? ['vme', 'rvv', 'dtcm', 'xfer'] : ['vme', 'rvv', 'dtcm'];
-  const time = (r) => (used[r] || 0) / peak_rate[r];
-  const top = pool.reduce((a, b) => (time(b) > time(a) ? b : a));
-  if (!overlap) segments.xfer = o.hc;
-  const onChip = Math.min(overlap ? o.tc : o.kc, time(top));
-  segments[top] = onChip;
-  segments.overhead = o.tc - segments.xfer - (top === 'xfer' ? 0 : onChip);
-  if (top === 'xfer') segments.overhead = o.tc - onChip;
-  return { total_cycles: o.tc, shape: o.shape, segments, peak_rate, required, used, active_cycles: {} };
+  const peak_rate = { vme: 2048 / VME_ARRAY_STEP, rvv: 32768 / L.rvvTile, dtcm: HW.dbus, xfer: HW.host_bw };
+  const active_cycles = {};
+  const used_accesses = o.dtcmAcc != null ? o.dtcmAcc : o.dtcm / DTCM_WIDEST;
+  const bytes_per_access = used_accesses ? o.dtcm / used_accesses : 0;
+  const required_accesses = bytes != null ? bytes / DTCM_WIDEST : null;
+  const c = HW.dtcm_c, Bus = HW.dbus;
+  const dtcm = {
+    used_bytes: o.dtcm, used_accesses, bytes_per_access, required_bytes: bytes, required_accesses,
+    c, cycles: used_accesses * Math.max(c, bytes_per_access / Bus),
+    min_cycles: required_accesses != null ? required_accesses * Math.max(c, DTCM_WIDEST / Bus) : null
+  };
+  const cycles = {}, min_cycles = {};
+  for (const { id } of RESOURCES) {
+    const modeled = id === 'dtcm' ? dtcm.cycles : (used[id] == null ? null : used[id] / peak_rate[id]);
+    cycles[id] = active_cycles[id] != null ? active_cycles[id] : modeled;
+    min_cycles[id] = id === 'dtcm' ? dtcm.min_cycles : (required[id] == null ? null : required[id] / peak_rate[id]);
+  }
+  const segments = Object.fromEntries(RESOURCES.map(({ id }) => [id, cycles[id] || 0]));
+  const busy = Object.values(segments).reduce((a, b) => a + b, 0);
+  const over = o.tc - busy;
+  if (over < 0) {
+    const key = `${o.id}|${o.shape}|${L.short}|${HW.name}`;
+    if (!dataWarned.has(key)) {
+      dataWarned.add(key);
+      console.warn(`data error: ${o.id} ${o.shape} resource cycles ${Math.round(busy)} > total_cycles ${Math.round(o.tc)}`);
+    }
+  }
+  segments.overhead = Math.max(0, over);
+  return { total_cycles: o.tc, shape: o.shape, segments, peak_rate, required, used, active_cycles, dtcm, cycles, min_cycles };
 }
 
 function run(P, HW, L, nq, ctx) {
@@ -288,7 +314,7 @@ function run(P, HW, L, nq, ctx) {
     o.hc = o.host / HW.host_bw;
     o.tc = overlap ? Math.max(o.kc, o.hc) : o.kc + o.hc;
     classify(o, HW, L);
-    o.m = moduleData(o, HW, L, overlap);
+    o.m = moduleData(o, HW, L);
   };
   let total = 0, kern = 0, moved = 0;
   for (const t of ['global', 'local']) for (const o of res[t]) { cost(o); total += counts[t] * o.tc; kern += counts[t] * o.kc; moved += counts[t] * o.host; }
@@ -496,6 +522,7 @@ function render() {
       ['hwp', 'dma_overlap', 'DMA overlaps compute', 'bool', 'not stated · 1 outstanding txn']
     ] : [['hwp', 'host_bw', 'Host→DTCM (B/cycle)', 0.5, 'measured · RTL bound 16']]),
     ['hwp', 'dbus', 'DTCM bus (B/cycle)', 4, 'confirmed · 128-bit LSU'],
+    ['hwp', 'dtcm_c', 'DTCM cycles / access', 0.1, 'loads-only loop · 25 cyc / 8 loads'],
     ['hwp', 'vme_step', 'VME cycles / step', 1, L.vmeStep ? 'measured · transposed A' : 'measured · k-sweep slope']
   ];
   let changed = 0;
@@ -591,17 +618,19 @@ function render() {
     if (BHW.ext) BHW.host_bw = BHW.hb_mhz * BHW.hb_bytes / BHW.clock_mhz;
     const bq = Math.min(S.seq, BP.n_ctx);
     base = run(BP, BHW, L, S.phase === 'prefill' ? bq : 1, bq);
+    base.hw = BHW;
   }
-  const barSegs = (segs, tot) => segOrder.filter((id) => segs[id] > 0)
-    .map((id) => `<span style="width:${(segs[id] / tot * 100).toFixed(3)}%;background:${segColor(id)}" title="${segName(id)} ${fmtInt(segs[id])} cycles"></span>`).join('');
+  const segSum = (segs) => segOrder.reduce((a, id) => a + segs[id], 0);
+  const barSegs = (segs) => segOrder.filter((id) => segs[id] > 0)
+    .map((id) => `<span style="width:${(segs[id] / segSum(segs) * 100).toFixed(3)}%;background:${segColor(id)}" title="${segName(id)} ${fmtInt(segs[id])} cycles"></span>`).join('');
 
   function donut(segs, total, W, H, r, compact) {
-    const cx = W / 2, cy = H / 2, sw = r * 0.42, C = 2 * Math.PI * r;
+    const cx = W / 2, cy = H / 2, sw = r * 0.42, C = 2 * Math.PI * r, sum = segSum(segs);
     let acc = 0, arcs = '';
     const labels = [];
     for (const id of segOrder) {
       if (!(segs[id] > 0)) continue;
-      const w = segs[id] / total;
+      const w = segs[id] / sum;
       arcs += `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${segColor(id)}" stroke-width="${sw}" stroke-dasharray="${(w * C).toFixed(3)} ${C.toFixed(3)}" stroke-dashoffset="${(-acc * C).toFixed(3)}" transform="rotate(-90 ${cx} ${cy})"><title>${segName(id)} ${fmtInt(segs[id])} cycles</title></circle>`;
       const ang = (acc + w / 2) * 2 * Math.PI;
       labels.push({ id, w, right: ang <= Math.PI, ax: cx + Math.sin(ang) * (r + sw / 2 + 3), y: cy - Math.cos(ang) * (r + sw / 2 + 10) });
@@ -632,8 +661,8 @@ function render() {
     const B = peak[mem.id], pV = peak.vme, pR = peak.rvv;
     const lg = (v) => Math.log10(Math.max(1e-6, v));
     const X = (v) => Math.min(R0, Math.max(L0, L0 + (lg(v) + 2) / 5 * (R0 - L0)));
-    const Y = (v) => Math.min(B0, Math.max(T0, B0 - (lg(v) + 2) / 4 * (B0 - T0)));
-    const xt = [0.01, 0.1, 1, 10, 100, 1000], yt = [100, 10, 1, 0.1, 0.01];
+    const Y = (v) => Math.min(B0, Math.max(T0, B0 - (lg(v) + 2) / 5 * (B0 - T0)));
+    const xt = [0.01, 0.1, 1, 10, 100, 1000], yt = [1000, 100, 10, 1, 0.1, 0.01];
     const xl = (v) => (v >= 1000 ? '1K' : String(v));
     const x0 = Math.max(0.01, 0.01 / B);
     // Modules within a few px share one dot; rows are sorted, so the first is the largest.
@@ -653,7 +682,7 @@ function render() {
       <div class="roofc"><svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="Roofline">
         <g stroke="var(--line)">${xt.map((v) => `<line x1="${X(v)}" y1="${T0}" x2="${X(v)}" y2="${B0}"/>`).join('')}${yt.map((v) => `<line x1="${L0}" y1="${Y(v)}" x2="${R0}" y2="${Y(v)}"/>`).join('')}</g>
         ${xt.map((v, i) => `<text x="${X(v)}" y="${B0 + 13}" text-anchor="${i === 5 ? 'end' : 'middle'}" class="d-v">${xl(v)}</text>`).join('')}
-        ${yt.map((v) => `<text x="${L0 - 5}" y="${Y(v) + 4}" text-anchor="end" class="d-v">${v}</text>`).join('')}
+        ${yt.map((v) => `<text x="${L0 - 5}" y="${Y(v) + 4}" text-anchor="end" class="d-v">${xl(v)}</text>`).join('')}
         <text x="${(L0 + R0) / 2}" y="${H - 3}" text-anchor="middle" class="d-v">ops / ${mem.short(HW)} byte</text>
         <text x="${L0 + 4}" y="${T0 + 11}" class="d-v">ops/cyc</text>
         <path d="M${X(x0)} ${Y(B * x0)} L${X(pV / B)} ${Y(pV)}" fill="none" stroke="${mem.color}" stroke-width="1.6"/>
@@ -728,7 +757,7 @@ function render() {
           const bw = base && S.bars === 'abs' ? baseTot(r) / scale * 100 : null;
           return `<button type="button" class="mod" data-sel="${r.key}" data-layer-set="${r.t}">
             <span class="mn">${esc(rowName(r))}</span>
-            <span class="mb"><span class="mf" style="width:${w.toFixed(2)}%">${barSegs(r.o.m.segments, r.o.m.total_cycles)}</span>${bw != null ? `<span class="mo" style="width:${bw.toFixed(2)}%"></span>` : ''}</span>
+            <span class="mb"><span class="mf" style="width:${w.toFixed(2)}%">${barSegs(r.o.m.segments)}</span>${bw != null ? `<span class="mo" style="width:${bw.toFixed(2)}%"></span>` : ''}</span>
             <span class="mv">${f3(r.tot)}</span><span class="mv mp">${p2(r.tot / cur.total)}</span></button>`;
         }).join('')}</div>
         <div class="sec-row"><div class="sec">${S.grid === 'achieved' ? 'Achieved %, over module' : 'Used ÷ required'}</div><div class="seg mini">${segHTML([['achieved', 'Achieved'], ['ratio', 'Used ÷ req']], S.grid, 'grid')}</div></div>
@@ -744,41 +773,59 @@ function render() {
     const m = o.m;
     const share = m.total_cycles * n / cur.total;
     const bo = base && (base.head.find((x) => x.id === sel) || base.res[lt].find((x) => x.id === sel));
-    const shown = segOrder.filter((id) => m.segments[id] > 0);
     const BAR_W = 382;
-    const label = (id) => `${segName(id)} ${f3(m.segments[id])}`;
-    const fits = (id) => label(id).length * 6.3 + 6 <= BAR_W * m.segments[id] / m.total_cycles;
-    const spill = shown.filter((id) => !fits(id));
+    const timeBar = (mm, tag, scale) => {
+      const segs = mm.segments, sum = segSum(segs), wf = sum / scale;
+      const shown = segOrder.filter((id) => segs[id] > 0);
+      const label = (id) => `${segName(id)} ${f3(segs[id])}`;
+      const fits = (id) => label(id).length * 6.3 + 6 <= BAR_W * wf * segs[id] / sum;
+      const spill = shown.filter((id) => !fits(id));
+      return `<div>${tag ? `<div class="tb-tag">${tag}</div>` : ''}
+        <div style="width:${(wf * 100).toFixed(2)}%">
+          <div class="tbar">${barSegs(segs)}</div>
+          <div class="tlabels">${shown.map((id) => `<span style="width:${(segs[id] / sum * 100).toFixed(3)}%">${fits(id) ? label(id) : ''}</span>`).join('')}</div>
+        </div>
+        ${spill.length ? `<div class="tspill">${spill.map((id) => `<span><span class="dot" style="background:${segColor(id)}"></span>${label(id)}</span>`).join('')}</div>` : ''}
+      </div>`;
+    };
+    const bm = bo ? bo.m : null;
+    const barScale = bm ? Math.max(segSum(m.segments), segSum(bm.segments)) : segSum(m.segments);
     const hasActive = RESOURCES.some((r) => m.active_cycles[r.id] != null);
+    const maxCyc = Math.max(1, ...RESOURCES.map((r) => m.cycles[r.id] || 0));
+    const change = (fmt, cur2, was) => {
+      const a = fmt(cur2);
+      if (!bm) return a;
+      const b = fmt(was);
+      return a === b ? a : `<small class="was">${b} →</small>${a}`;
+    };
+    const acc = (v) => (v == null ? '—' : f3(v) + ' acc');
     const rowsHTML = RESOURCES.map((r) => {
-      const u = m.used[r.id], q = m.required[r.id], peak = m.peak_rate[r.id];
-      const den = m.active_cycles[r.id] != null ? m.active_cycles[r.id] : m.total_cycles;
-      const rate = u == null ? null : u / den;
-      const a = rate == null ? null : rate / peak;
-      const x = q > 0 && u != null ? (u / q).toFixed(1) : null;
+      const id = r.id, u = m.used[id], q = m.required[id], cyc = m.cycles[id], mn = m.min_cycles[id];
+      const isD = id === 'dtcm';
+      const x = u === 0 ? '0' : cyc != null && mn > 0 ? (cyc / mn).toFixed(1) : '—';
+      const usedCell = change((v) => amount(r, v), u, bm && bm.used[id]);
+      const cycCell = change(f3, cyc, bm && bm.cycles[id]);
       return `<div class="rt${!u ? ' zero' : ''}">
-        <span class="rn"><span class="dot" style="background:${r.color}"></span>${esc(r.name(HW))}</span>
-        <span class="num">${f3(peak)}<small>${r.rate}</small></span>
-        <span class="num">${rate == null ? '—' : rate === 0 ? '0' : f3(rate)}${rate ? `<small>${r.rate}</small>` : ''}
-          <span class="ach"><span class="ab"><span style="width:${(Math.min(1, a || 0) * 100).toFixed(1)}%;background:${r.color}"></span></span><span>${p2(a)}</span></span></span>
-        <span class="num">${amount(r, q)}</span>
-        <span class="num">${amount(r, u)}${x && x !== '1.0' ? `<small>×${x}</small>` : ''}</span>
+        <span class="rn"><span class="dot" style="background:${r.color}"></span><span>${esc(r.name(HW))}</span></span>
+        <span class="num">${f3(m.peak_rate[id])}<small>${r.rate}</small>${isD ? `<small>${m.dtcm.c} cyc/acc</small>` : ''}</span>
+        <span class="num">${usedCell}${isD ? `<span class="l2">${change(acc, m.dtcm.used_accesses, bm && bm.dtcm.used_accesses)}</span><small>${f3(m.dtcm.bytes_per_access)} B/acc</small>` : ''}</span>
+        <span class="num">${amount(r, q)}${isD ? `<span class="l2">${acc(m.dtcm.required_accesses)}</span>` : ''}</span>
+        <span class="num">${f3(mn)}</span>
+        <span class="num">${cycCell}</span>
+        <span class="num">${x}</span>
+        <span class="cbar"><span style="width:${((cyc || 0) / maxCyc * 100).toFixed(2)}%;background:${r.color}"></span>${mn != null ? `<i style="left:${Math.min(100, mn / maxCyc * 100).toFixed(2)}%"></i>` : ''}</span>
       </div>`;
     }).join('');
     $('right').innerHTML = `
       <section class="popup grow" aria-label="${esc(o.id)}">
         <div class="chrome"><b class="mono">${esc(o.id)}</b><button type="button" class="icon-btn" data-act="clear" aria-label="Close">✕</button></div>
         <div class="ph">
-          <div class="ph-top"><span class="ph-big">${bo ? f3(bo.m.total_cycles) + ' → ' : ''}${f3(m.total_cycles)} cycles</span><span class="ph-time">${t3(m.total_cycles, HW)}</span></div>
+          <div class="ph-top"><span class="ph-big">${bm ? f3(bm.total_cycles) + ' → ' : ''}${f3(m.total_cycles)} cycles</span><span class="ph-time">${bm ? t3(bm.total_cycles, base.hw) + ' → ' : ''}${t3(m.total_cycles, HW)}</span></div>
           <div class="ph-sub">${esc(m.shape)} · ×${n} · ${p2(share)} of model${o.flag ? ' · scaled' : ''}</div>
         </div>
         ${roofline()}
-        <div>
-          <div class="tbar">${barSegs(m.segments, m.total_cycles)}</div>
-          <div class="tlabels">${shown.map((id) => `<span style="width:${(m.segments[id] / m.total_cycles * 100).toFixed(3)}%">${fits(id) ? label(id) : ''}</span>`).join('')}</div>
-          ${spill.length ? `<div class="tspill">${spill.map((id) => `<span><span class="dot" style="background:${segColor(id)}"></span>${label(id)}</span>`).join('')}</div>` : ''}
-        </div>
-        <div class="rtw"><div class="rt rh"><span>Resource</span><span class="num">Peak</span><span class="num">${hasActive ? 'Achieved, while active' : 'Achieved, over module'}</span><span class="num">Required</span><span class="num">Used</span></div>${rowsHTML}</div>
+        <div class="tbs">${bm ? timeBar(bm, 'before', barScale) + timeBar(m, 'after', barScale) : timeBar(m, '', barScale)}</div>
+        <div class="rtw"><div class="rt rh"><span>Resource</span><span class="num">Peak</span><span class="num">Used</span><span class="num">Required</span><span class="num">Min cycles</span><span class="num">${hasActive ? 'Cycles, measured' : 'Cycles, modeled'}</span><span class="num">×</span></div>${rowsHTML}</div>
       </section>`;
   }
   [...$('right').querySelectorAll('.grow')].forEach((e, i) => { if (scrollKeep[i] != null) e.scrollTop = scrollKeep[i]; });
@@ -893,6 +940,7 @@ function parseHW(j, file) {
       file, label: String(j.name || file), name: 'HyperRAM via DMA', ext: true,
       clock_mhz: g('clock_mhz') || 50, dbus: g('dbus_bytes_per_cycle', 'memory.dtcm.bus_bytes_per_cycle') || 16,
       vme_step: g('vme_cycles_per_matmul_step', 'engines.vme.cycles_per_step') || 84,
+      dtcm_c: g('dtcm_cycles_per_access', 'memory.dtcm.cycles_per_access') || 3.1,
       hb_mhz: busMhz, hb_bytes: mbs ? mbs / busMhz : (g('hyperram.bytes_per_clock', 'memory.hyperram.bytes_per_clock') || 2),
       dma_overlap: (j.dma && num(j.dma.overlap)) ? 1 : 0, clockConfirmed: !!(j.clock_mhz && j.clock_mhz.confirmed)
     };
@@ -904,6 +952,7 @@ function parseHW(j, file) {
     host_bw: g('host_to_dtcm_bytes_per_cycle', 'interconnect.host_to_dtcm_bytes_per_cycle'),
     dbus: g('dbus_bytes_per_cycle', 'memory.dtcm.bus_bytes_per_cycle'),
     vme_step: g('vme_cycles_per_matmul_step', 'engines.vme.cycles_per_step') || 84,
+    dtcm_c: g('dtcm_cycles_per_access', 'memory.dtcm.cycles_per_access') || 3.1,
     clockConfirmed: !!(j.clock_mhz && j.clock_mhz.confirmed)
   };
   const miss = ['clock_mhz', 'host_bw', 'dbus'].filter((k) => !out[k]);

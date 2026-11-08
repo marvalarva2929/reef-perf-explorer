@@ -189,7 +189,7 @@ button.mod:hover, button.ug:hover { background: var(--control); }
 .tspill > span { display: inline-flex; align-items: center; gap: 4px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; display: inline-block; }
 .rtw { overflow-x: auto; display: flex; flex-direction: column; }
-.rt { display: grid; grid-template-columns: 80px 48px minmax(72px, 1fr) 66px 66px; column-gap: 6px; padding: 6px 0; border-top: 1px solid var(--line); font-size: 11.5px; min-width: 366px; }
+.rt { display: grid; grid-template-columns: 56px 44px 62px 62px 40px 46px 28px; justify-content: space-between; column-gap: 4px; row-gap: 4px; padding: 6px 0; border-top: 1px solid var(--line); font-size: 11px; min-width: 368px; }
 .rt.rh { border-top: 0; padding-top: 0; font-size: 11px; color: var(--muted); align-items: end; }
 .rt.zero, .rt.zero .num small { color: var(--muted); }
 .rn { display: flex; align-items: flex-start; gap: 5px; font-weight: 600; }
@@ -197,9 +197,6 @@ button.mod:hover, button.ug:hover { background: var(--control); }
 .num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
 .rh .num { font-family: var(--sans); }
 .num small { display: block; font-size: 10px; color: var(--muted); }
-.ach { display: flex; align-items: center; justify-content: flex-end; gap: 4px; margin-top: 3px; font-size: 10.5px; }
-.ab { flex: 1 1 auto; max-width: 44px; height: 5px; background: var(--track); border-radius: 2px; overflow: hidden; }
-.ab span { display: block; height: 100%; }
 @media (min-width: 761px) {
   .nav { flex-wrap: nowrap; align-items: center; padding: 7px 16px; gap: 16px; }
   .nav .field { display: flex; align-items: center; gap: 7px; min-width: 0; flex: 0 1 auto; }
@@ -216,3 +213,10 @@ button.mod:hover, button.ug:hover { background: var(--control); }
 .rp:hover { box-shadow: 0 0 0 2px var(--text); }
 .rp.dim { opacity: 0.5; }
 .rp.on { width: 14px; height: 14px; border: 2px solid var(--text); }
+.tbs { display: flex; flex-direction: column; gap: 6px; }
+.tb-tag { font-size: 11px; color: var(--muted); margin-bottom: 2px; }
+.num .l2 { display: block; margin-top: 3px; }
+.num small.was { color: var(--muted); }
+.cbar { grid-column: 1 / -1; position: relative; display: block; height: 5px; background: var(--track); border-radius: 2px; }
+.cbar > span { display: block; height: 100%; border-radius: 2px; }
+.cbar i { position: absolute; top: -2px; bottom: -2px; width: 2px; margin-left: -2px; background: var(--text); }

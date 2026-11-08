@@ -28,11 +28,14 @@ the DTCM bus, the transfer path). Demand ÷ capacity gives each one's busy cycle
 and kernel time not explained by compute or DTCM counts as overhead. The block is
 bound by whichever is largest.
 
-The side panels use one resource list (VME, RVV, DTCM ↔ core, HyperRAM DMA). Each
-module's time is split into segments: the serial transfer gets its full time, the
-on-chip resource with the largest used ÷ peak gets that many cycles, and the rest
-of the kernel is overhead. Required amounts come from the shape for matmuls and
-attention ops; anything not derivable shows "—".
+The side panels use one resource list (VME, RVV, DTCM ↔ core, HyperRAM DMA) and
+sequential timing: total cycles = the sum of resource cycles + overhead. A resource's
+cycles are used ÷ peak, except DTCM: accesses × max(c, bytes per access ÷ B), with
+c = 3.1 cycles per access and B = 16 B/cycle. Min cycles use the required amounts
+(DTCM: required bytes ÷ 16 accesses). The VME peak is the array alone (6.9 cycles per
+16×16×4 step), so operand loads count under DTCM. DTCM access counts are modeled from
+loop structure; pointwise and attention assume 16 B accesses. If resource cycles
+exceed total cycles, overhead shows 0 and the console logs a data error.
 
 The roofline's y axis is used ops over total cycles, the same value as Achieved in
 the table. Its x axis and memory roof follow the DTCM / DMA toggle.
