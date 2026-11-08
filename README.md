@@ -23,9 +23,10 @@ from [LonghornSilicon/reef](https://github.com/LonghornSilicon/reef):
 - every tile's inputs (weights, activations, K/V blocks) come in and its outputs
   go out over the transfer path set by the hardware config (below).
 
-Bound labels: transfer (HyperRAM or host) if it exceeds kernel time; compute if the kernel
-reaches ≥60% of its engine's measured peak; DTCM if the bus is ≥60% busy;
-otherwise latency/overhead.
+Bound labels: each block puts demand on a set of resources (its compute engine,
+the DTCM bus, the transfer path). Demand ÷ capacity gives each one's busy cycles,
+and kernel time not explained by compute or DTCM counts as overhead. The block is
+bound by whichever is largest.
 
 ## Hardware configs
 

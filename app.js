@@ -99,7 +99,7 @@ const BOUNDS = {
   compute: { label: 'Compute', color: '#6b98ff' },
   dtcm: { label: 'Memory · DTCM', color: '#f5c26b' },
   host: { label: 'Host transfer', color: '#e07b3c' },
-  latency: { label: 'Latency / overhead', color: '#737b88' }
+  latency: { label: 'Latency / overhead', color: '#aab3c0' }
 };
 
 const DESCS = {
@@ -232,10 +232,10 @@ function classify(o, HW, L) {
   o.cu = (o.ops / o.peak) / o.kc;
   o.du = (o.dtcm / HW.dbus) / o.kc;
   o.hu = o.hc / o.tc;
-  if (o.hc > o.kc) o.bound = 'host';
-  else if (o.cu >= 0.6) o.bound = 'compute';
-  else if (o.du >= 0.6) o.bound = 'dtcm';
-  else o.bound = 'latency';
+  // Demand / capacity per resource, in cycles; the bottleneck is the largest.
+  const compute = o.ops / o.peak, dtcm = o.dtcm / HW.dbus;
+  o.busy = { compute, dtcm, host: o.hc, latency: Math.max(0, o.kc - Math.max(compute, dtcm)) };
+  o.bound = Object.keys(o.busy).reduce((a, b) => (o.busy[b] > o.busy[a] ? b : a));
 }
 
 function run(P, HW, L, nq, ctx) {
@@ -499,7 +499,7 @@ function render() {
     <div class="abs row-label" style="left:264px;top:112px">Attention sub-block</div>
     <div class="abs row-label" style="left:264px;top:324px">MLP sub-block</div>
     <div class="abs row-label" style="left:264px;top:576px">Output head · once per step</div>
-    <svg class="abs" width="1500" height="820" viewBox="0 0 1500 820" aria-hidden="true" style="left:0;top:0"><path d="${edgePath()}" fill="none" stroke="#5a616c" stroke-width="1.6" stroke-linejoin="round"/></svg>
+    <svg class="abs" width="1500" height="820" viewBox="0 0 1500 820" aria-hidden="true" style="left:0;top:0"><path d="${edgePath()}" fill="none" stroke="#98a2b1" stroke-width="1.6" stroke-linejoin="round"/></svg>
     <div class="abs endpoint" style="left:40px;top:120px;width:150px">${S.phase === 'prefill' ? 'tokens in · ' + seq : 'token in · ctx ' + seq}</div>
     <div class="abs ghost-node"><span class="mono" style="font-weight:600;font-size:14px">embedding</span><span class="small muted">host gather</span><span class="small muted">not modeled</span></div>
     <div class="abs endpoint" style="left:744px;top:654px;width:180px">logits · ${P.vocab}</div>
@@ -543,35 +543,47 @@ function render() {
     const stats = [
       [inHead ? 'Time' : 'Time / layer', T(o.tc)],
       [`In model (×${n})`, `${T(o.tc * n)} · ${pct(o.tc * n / cur.total)}`],
-      ['Kernel cycles', fmtC(o.kc)], [XF + ' cycles', fmtC(o.hc)],
-      ['DTCM↔core bytes', fmtB(o.dtcm)], [XF + ' bytes', fmtB(o.host)],
-      ['Shape', o.shape], ['Attained', `${(o.ops / o.kc).toFixed(2)} of ${o.peak.toFixed(1)} ops/cyc`]
+      ['Kernel cycles', fmtC(o.kc)], ['Shape', o.shape]
+    ];
+    const resources = [
+      ['compute', o.engine === 'VME' ? 'VME array' : 'RVV vector', fmtC(o.ops) + ' ops', o.peak.toFixed(1) + ' ops/cyc', fmtC(o.busy.compute) + ' cyc'],
+      ['dtcm', 'DTCM ↔ core', fmtB(o.dtcm), HW.dbus + ' B/cyc', fmtC(o.busy.dtcm) + ' cyc'],
+      ['host', HW.ext ? 'HyperRAM DMA' : 'Host AXI', fmtB(o.host), HW.host_bw.toFixed(2) + ' B/cyc', fmtC(o.busy.host) + ' cyc'],
+      ['latency', 'Kernel overhead', fmtC(o.busy.latency) + ' cyc', '—', 'not at a roof']
     ];
     const lg = (v) => Math.log10(Math.max(1e-6, v));
     const rx = (x) => Math.min(348, Math.max(44, 44 + (lg(x) + 2) / 5 * 304));
     const ry = (y) => Math.min(200, Math.max(12, 200 - (lg(y) + 2) / 4 * 188));
     const pV = 2048 / HW.vme_step, pR = 32768 / L.rvvTile;
     const pts = all.filter((p) => p !== o).map((p) =>
-      `<span class="pt" title="${p.id}" style="left:${rx(p.ops / p.dtcm) - 4}px;top:${ry(p.ops / p.kc) - 4}px;width:8px;height:8px;background:#4a515c;border:1px solid #171a1f"></span>`).join('') +
-      `<span class="pt" title="${o.id}" style="left:${rx(o.ops / o.dtcm) - 7}px;top:${ry(o.ops / o.kc) - 7}px;width:14px;height:14px;background:${B.color};border:2px solid #e8eaed"></span>`;
+      `<span class="pt" title="${p.id}" style="left:${rx(p.ops / p.dtcm) - 4}px;top:${ry(p.ops / p.kc) - 4}px;width:8px;height:8px;background:#aab3c0;border:1px solid #2c323c"></span>`).join('') +
+      `<span class="pt" title="${o.id}" style="left:${rx(o.ops / o.dtcm) - 7}px;top:${ry(o.ops / o.kc) - 7}px;width:14px;height:14px;background:${B.color};border:2px solid #f5f7fa"></span>`;
     const gx = [44, 104.8, 165.6, 226.4, 287.2, 348], gy = [12, 59, 106, 153, 200];
     $('right').innerHTML = `
       <section class="popup grow" aria-label="Block stats">
         <div class="roof">
           <svg width="348" height="232" viewBox="0 0 352 232" role="img" aria-label="Roofline: this block against the VME and RVV ceilings">
-            <g stroke="#262a31">${gx.map((x) => `<line x1="${x}" y1="12" x2="${x}" y2="200"/>`).join('')}${gy.map((y) => `<line x1="44" y1="${y}" x2="348" y2="${y}"/>`).join('')}</g>
-            <g font-family="IBM Plex Mono, monospace" font-size="10" fill="#a3a9b3">
+            <g stroke="#4a5361">${gx.map((x) => `<line x1="${x}" y1="12" x2="${x}" y2="200"/>`).join('')}${gy.map((y) => `<line x1="44" y1="${y}" x2="348" y2="${y}"/>`).join('')}</g>
+            <g font-family="IBM Plex Mono, monospace" font-size="11" fill="#dde2e9">
               ${['0.01', '0.1', '1', '10', '100', '1k'].map((t, i) => `<text x="${gx[i]}" y="214" text-anchor="${i === 5 ? 'end' : 'middle'}">${t}</text>`).join('')}
               ${['100', '10', '1', '0.1', '0.01'].map((t, i) => `<text x="38" y="${gy[i] + 3}" text-anchor="end">${t}</text>`).join('')}
               <text x="196" y="230" text-anchor="middle">ops per DTCM↔core byte</text></g>
-            <path d="M${rx(0.01)} ${ry(HW.dbus * 0.01)} L${rx(pV / HW.dbus)} ${ry(pV)} L348 ${ry(pV)}" fill="none" stroke="#e8eaed" stroke-width="1.6"/>
-            <path d="M${rx(pR / HW.dbus)} ${ry(pR)} L348 ${ry(pR)}" fill="none" stroke="#e8eaed" stroke-width="1.2" stroke-dasharray="4 3"/>
-            <text x="346" y="${ry(pV) + 12}" text-anchor="end" font-size="10" fill="#e8eaed" font-family="IBM Plex Sans, sans-serif">VME peak ${pV.toFixed(1)}</text>
-            <text x="346" y="${ry(pR) - 4}" text-anchor="end" font-size="10" fill="#e8eaed" font-family="IBM Plex Sans, sans-serif">RVV peak ${pR.toFixed(2)}</text>
+            <path d="M${rx(0.01)} ${ry(HW.dbus * 0.01)} L${rx(pV / HW.dbus)} ${ry(pV)} L348 ${ry(pV)}" fill="none" stroke="#f5f7fa" stroke-width="1.6"/>
+            <path d="M${rx(pR / HW.dbus)} ${ry(pR)} L348 ${ry(pR)}" fill="none" stroke="#f5f7fa" stroke-width="1.2" stroke-dasharray="4 3"/>
+            <text x="346" y="${ry(pV) + 12}" text-anchor="end" font-size="11" fill="#f5f7fa" font-family="IBM Plex Sans, sans-serif">VME peak ${pV.toFixed(1)}</text>
+            <text x="346" y="${ry(pR) - 4}" text-anchor="end" font-size="11" fill="#f5f7fa" font-family="IBM Plex Sans, sans-serif">RVV peak ${pR.toFixed(2)}</text>
           </svg>${pts}
         </div>
         <div class="sel-line"><b class="mono">${o.id}</b><span class="sw" style="background:${B.color}"></span><span class="small" style="flex-grow:1;color:var(--text-2)">${B.label} · ${o.engine}</span>
           <button type="button" class="icon-btn" data-act="clear" aria-label="Close">✕</button></div>
+        <div class="res">
+          <div class="res-row res-head"><span>Resource</span><span>Demand</span><span>Capacity</span><span class="u">Util</span></div>
+          ${resources.map(([k, name, demand, cap, sub]) => {
+            const u = Math.min(1, o.busy[k] / o.tc);
+            return `<div class="res-row${k === o.bound ? ' hot' : ''}"><span class="n">${name}<small>${sub}</small></span><span class="mono">${demand}</span><span class="mono">${cap}</span><span class="mono u">${pct(u)}</span>
+              <span class="track"><span style="width:${(u * 100).toFixed(1)}%;background:${BOUNDS[k].color}"></span></span></div>`;
+          }).join('')}
+        </div>
         <div class="stats">${stats.map(([k, v]) => `<div><span class="k">${k}</span><span class="v">${esc(v)}</span></div>`).join('')}</div>
         ${o.flag ? `<div class="flag">${esc(o.flagText)}</div>` : ''}
       </section>`;
