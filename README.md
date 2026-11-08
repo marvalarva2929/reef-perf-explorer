@@ -28,6 +28,12 @@ the DTCM bus, the transfer path). Demand ÷ capacity gives each one's busy cycle
 and kernel time not explained by compute or DTCM counts as overhead. The block is
 bound by whichever is largest.
 
+The side panels use one resource list (VME, RVV, DTCM ↔ core, HyperRAM DMA). Each
+module's time is split into segments: the serial transfer gets its full time, the
+on-chip resource with the largest used ÷ peak gets that many cycles, and the rest
+of the kernel is overhead. Required amounts come from the shape for matmuls and
+attention ops; anything not derivable shows "—".
+
 ## Hardware configs
 
 | Config | Transfer path | Source |

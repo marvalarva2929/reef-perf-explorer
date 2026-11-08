@@ -95,6 +95,15 @@ const HARDWARE = {
   a0: { label: 'hardware.json · host AXI', file: 'hardware.json', name: 'host AXI, no DMA', clock_mhz: 50, host_bw: 15.745, dbus: 16, vme_step: 84, clockConfirmed: false, ext: false }
 };
 
+// Side-panel resource list. Every panel view reads this; order is display order.
+const RESOURCES = [
+  { id: 'vme', name: () => 'VME', short: () => 'VME', unit: 'ops', rate: 'ops/cyc', color: '#6b98ff' },
+  { id: 'rvv', name: () => 'RVV', short: () => 'RVV', unit: 'ops', rate: 'ops/cyc', color: '#4fd1b5' },
+  { id: 'dtcm', name: () => 'DTCM ↔ core', short: () => 'DTCM', unit: 'bytes', rate: 'B/cyc', color: '#f5c26b' },
+  { id: 'xfer', name: (HW) => (HW.ext ? 'HyperRAM DMA' : 'Host AXI'), short: (HW) => (HW.ext ? 'DMA' : 'Host'), unit: 'bytes', rate: 'B/cyc', color: '#e07b3c' }
+];
+const OVERHEAD = { id: 'overhead', color: '#aab3c0' };
+
 const BOUNDS = {
   compute: { label: 'Compute', color: '#6b98ff' },
   dtcm: { label: 'Memory · DTCM', color: '#f5c26b' },
@@ -143,7 +152,10 @@ function matmul(id, n, k, m, HW, L) {
   return {
     id, engine: vme ? 'VME' : 'RVV', kind: 'matmul · ' + (vme ? 'VME' : 'RVV'),
     shape: `${n}×${k}×${m}`, ops: 2 * n * k * m, kc: at * mt * kc, dtcm: at * mt * dt,
-    host: at * host, tiles: at * mt * chunks.length, src, flag: false
+    host: at * host, tiles: at * mt * chunks.length, src, flag: false,
+    // The array computes all 16 rows on a GEMV tile; only one is useful.
+    usedOps: 2 * at * mt * chunks.reduce((a, c) => a + (gemv ? 16 : tn) * c * tm, 0),
+    reqOps: 2 * n * k * m, reqBytes: n * k + k * m + 4 * n * m
   };
 }
 
@@ -179,6 +191,7 @@ function attention(P, nq, ctx, window, L) {
     id: 'attention', engine: nq > 1 ? 'VME' : 'RVV', kind: 'flash attention · ' + (nq > 1 ? 'VME' : 'RVV'),
     shape: `q${nq} kv${Math.min(ctx, window)} d${DH} ×${H}h`, ops: H * 4 * visible * DH,
     kc: H * (pairs * per + qBlocks * fin), dtcm: H * pairs * (mm + state), host, tiles: H * pairs, flag,
+    usedOps: H * pairs * qb * block * DH * 4, reqOps: H * 4 * visible * DH, otherUnknown: true,
     src: flag ? `no stream at d_head ${DH} · interpolated between d32 and d64`
               : L.split && L.split[DH]
                 ? `${stream} = ${fmtInt(L.split[DH][ph][0])} cyc / KV block + ${fmtInt(L.split[DH][ph][1])} finish`
@@ -207,7 +220,8 @@ function pointwise(id, kind, elems, d, L) {
   const tiles = cdiv(elems, te), ht = hw + out, dt = ht + (kind === 'layernorm' ? te : 0);
   return {
     id, engine: 'RVV', kind: kind + ' · RVV', shape: kind === 'layernorm' ? `${elems / d}×${d}` : `${elems} elems`,
-    ops: ops * tiles, kc: cyc * tiles, dtcm: dt * tiles, host: ht * tiles, tiles, src: srcName, flag, flagText
+    ops: ops * tiles, kc: cyc * tiles, dtcm: dt * tiles, host: ht * tiles, tiles, src: srcName, flag, flagText,
+    usedOps: ops * tiles
   };
 }
 
@@ -238,6 +252,25 @@ function classify(o, HW, L) {
   o.bound = Object.keys(o.busy).reduce((a, b) => (o.busy[b] > o.busy[a] ? b : a));
 }
 
+// Per-module record for the side panel. segments sum to total_cycles.
+function moduleData(o, HW, L, overlap) {
+  const eng = o.engine === 'VME' ? 'vme' : 'rvv', oth = eng === 'vme' ? 'rvv' : 'vme';
+  const other = o.otherUnknown ? null : 0, bytes = o.reqBytes != null ? o.reqBytes : null;
+  const used = { [eng]: o.usedOps, [oth]: other, dtcm: o.dtcm, xfer: o.host };
+  const required = { [eng]: o.reqOps != null ? o.reqOps : null, [oth]: other, dtcm: bytes, xfer: bytes };
+  const peak_rate = { vme: 2048 / HW.vme_step, rvv: 32768 / L.rvvTile, dtcm: HW.dbus, xfer: HW.host_bw };
+  const segments = { vme: 0, rvv: 0, dtcm: 0, xfer: 0, overhead: 0 };
+  const pool = overlap ? ['vme', 'rvv', 'dtcm', 'xfer'] : ['vme', 'rvv', 'dtcm'];
+  const time = (r) => (used[r] || 0) / peak_rate[r];
+  const top = pool.reduce((a, b) => (time(b) > time(a) ? b : a));
+  if (!overlap) segments.xfer = o.hc;
+  const onChip = Math.min(overlap ? o.tc : o.kc, time(top));
+  segments[top] = onChip;
+  segments.overhead = o.tc - segments.xfer - (top === 'xfer' ? 0 : onChip);
+  if (top === 'xfer') segments.overhead = o.tc - onChip;
+  return { total_cycles: o.tc, shape: o.shape, segments, peak_rate, required, used, active_cycles: {} };
+}
+
 function run(P, HW, L, nq, ctx) {
   const counts = P.alternating
     ? { global: Math.ceil(P.layers / 2), local: Math.floor(P.layers / 2) }
@@ -255,6 +288,7 @@ function run(P, HW, L, nq, ctx) {
     o.hc = o.host / HW.host_bw;
     o.tc = overlap ? Math.max(o.kc, o.hc) : o.kc + o.hc;
     classify(o, HW, L);
+    o.m = moduleData(o, HW, L, overlap);
   };
   let total = 0, kern = 0, moved = 0;
   for (const t of ['global', 'local']) for (const o of res[t]) { cost(o); total += counts[t] * o.tc; kern += counts[t] * o.kc; moved += counts[t] * o.host; }
@@ -285,13 +319,46 @@ function fmtB(n) {
   return Math.round(n) + ' B';
 }
 const pct = (x) => (x * 100).toFixed(x < 0.1 ? 1 : 0) + '%';
+// Panel number format: 3 significant figures, K/M/G suffixes.
+function f3(n) {
+  if (n == null) return '—';
+  if (n === 0) return '0';
+  const sfx = ['', 'K', 'M', 'G', 'T'];
+  let a = n, i = 0;
+  while (a >= 1000 && i < 4) { a /= 1000; i++; }
+  let t = +a.toPrecision(3);
+  if (t >= 1000 && i < 4) { t /= 1000; i++; }
+  return (t >= 100 ? t.toFixed(0) : t >= 10 ? t.toFixed(1) : t.toFixed(2)) + sfx[i];
+}
+function fB2(n) {
+  if (n == null) return '—';
+  if (n === 0) return '0';
+  const u = ['B', 'KB', 'MB', 'GB'];
+  let a = n, i = 0;
+  while (a >= 1024 && i < 3) { a /= 1024; i++; }
+  const t = +a.toPrecision(3);
+  return (t >= 100 ? t.toFixed(0) : t >= 10 ? t.toFixed(1) : i ? t.toFixed(2) : t.toFixed(0)) + ' ' + u[i];
+}
+function p2(x) {
+  if (x == null) return '—';
+  if (x === 0) return '0%';
+  return (x >= 0.1 ? (x * 100).toFixed(0) : (x * 100).toFixed(1)) + '%';
+}
+const hzFmt = (v) => f3(v);
+function t3(cyc, HW) {
+  const ms = cyc / (HW.clock_mhz * 1e3);
+  if (ms >= 60000) return f3(ms / 60000) + ' min';
+  if (ms >= 1000) return f3(ms / 1000) + ' s';
+  return f3(ms) + ' ms';
+}
+const amount = (r, v) => (v == null ? '—' : v === 0 ? '0' : r.unit === 'ops' ? f3(v) + ' ops' : fB2(v));
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 /* --------------------------------------------------------------- state */
 
 const S = {
   model: 'neo', hw: 'hyperram', res: 'transposed', phase: 'decode', seq: 1024, layerType: 'global', sel: null,
-  p: {}, hwp: {}, whatif: false, zoom: null, fit: 0.9
+  p: {}, hwp: {}, whatif: false, zoom: null, fit: 0.9, bars: 'abs', grid: 'achieved'
 };
 
 (function readHash() {
@@ -407,7 +474,6 @@ function render() {
   $('model-select').title = BP.file;
   $('hw-select').innerHTML = optionsHTML(HARDWARE, (h) => h.label || h.file, S.hw, '<option value="__import">Import JSON…</option>');
   $('hw-select').title = BH.file;
-  const XF = HW.ext ? 'HyperRAM↔TCM' : 'Host↔DTCM';
   $('res-select').innerHTML = optionsHTML(RESULTS, (r) => r.short, S.res);
   $('res-select').title = L.note;
   $('phase-seg').innerHTML = segHTML([['prefill', 'Prefill'], ['decode', 'Decode']], S.phase, 'phase');
@@ -515,77 +581,160 @@ function render() {
 
   // ---- right panel
   const scrollKeep = [...$('right').querySelectorAll('.grow')].map((e) => e.scrollTop);
+  const segOrder = [...RESOURCES.map((r) => r.id), OVERHEAD.id];
+  const segColor = (id) => (id === OVERHEAD.id ? OVERHEAD.color : RESOURCES.find((r) => r.id === id).color);
+  const segName = (id) => (id === OVERHEAD.id ? 'overhead' : RESOURCES.find((r) => r.id === id).short(HW));
+  // Baseline: the loaded configs, when What-if edits are active.
+  let base = null;
+  if (changed) {
+    const BHW = { ...BH };
+    if (BHW.ext) BHW.host_bw = BHW.hb_mhz * BHW.hb_bytes / BHW.clock_mhz;
+    const bq = Math.min(S.seq, BP.n_ctx);
+    base = run(BP, BHW, L, S.phase === 'prefill' ? bq : 1, bq);
+  }
+  const barSegs = (segs, tot) => segOrder.filter((id) => segs[id] > 0)
+    .map((id) => `<span style="width:${(segs[id] / tot * 100).toFixed(3)}%;background:${segColor(id)}" title="${segName(id)} ${fmtInt(segs[id])} cycles"></span>`).join('');
+
+  function donut(segs, total, W, H, r, compact) {
+    const cx = W / 2, cy = H / 2, sw = r * 0.42, C = 2 * Math.PI * r;
+    let acc = 0, arcs = '';
+    const labels = [];
+    for (const id of segOrder) {
+      if (!(segs[id] > 0)) continue;
+      const w = segs[id] / total;
+      arcs += `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${segColor(id)}" stroke-width="${sw}" stroke-dasharray="${(w * C).toFixed(3)} ${C.toFixed(3)}" stroke-dashoffset="${(-acc * C).toFixed(3)}" transform="rotate(-90 ${cx} ${cy})"><title>${segName(id)} ${fmtInt(segs[id])} cycles</title></circle>`;
+      const ang = (acc + w / 2) * 2 * Math.PI;
+      labels.push({ id, w, right: ang <= Math.PI, ax: cx + Math.sin(ang) * (r + sw / 2 + 3), y: cy - Math.cos(ang) * (r + sw / 2 + 10) });
+      acc += w;
+    }
+    const gap = compact ? 37 : 26;
+    for (const side of [true, false]) {
+      const g = labels.filter((l) => l.right === side).sort((a, b) => a.y - b.y);
+      g.forEach((l, i) => { l.y = Math.max(l.y, i ? g[i - 1].y + gap : 12); });
+      for (let i = g.length - 1; i >= 0; i--) g[i].y = Math.min(g[i].y, (i < g.length - 1 ? g[i + 1].y - gap : H - 16));
+    }
+    const text = labels.map((l) => {
+      const x = cx + (l.right ? 1 : -1) * (r + sw / 2 + 8), a = l.right ? 'start' : 'end';
+      return `<text x="${x}" y="${l.y}" text-anchor="${a}" class="d-n" fill="${segColor(l.id)}">${segName(l.id)}</text>` + (compact
+        ? `<text x="${x}" y="${l.y + 12}" text-anchor="${a}" class="d-v">${f3(segs[l.id])}</text><text x="${x}" y="${l.y + 24}" text-anchor="${a}" class="d-v">${p2(l.w)}</text>`
+        : `<text x="${x}" y="${l.y + 12}" text-anchor="${a}" class="d-v">${f3(segs[l.id])} ${p2(l.w)}</text>`);
+    }).join('');
+    return `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="Time by segment">${arcs}${text}
+      <text x="${cx}" y="${cy + 2}" text-anchor="middle" class="d-t" style="font-size:${(r * 0.36).toFixed(1)}px">${f3(total)}</text>${compact ? '' : `<text x="${cx}" y="${cy + r * 0.36}" text-anchor="middle" class="d-v">cycles</text>`}</svg>`;
+  }
+
   if (!sel) {
-    const mixAcc = Object.fromEntries(Object.keys(BOUNDS).map((k) => [k, 0]));
-    for (const r of rows) mixAcc[r.o.bound] += r.tot;
-    const mix = Object.keys(BOUNDS).map((k) => ({ ...BOUNDS[k], w: mixAcc[k] / cur.total }));
+    const sumSegs = (list) => {
+      const out = Object.fromEntries(segOrder.map((id) => [id, 0]));
+      for (const [o, n] of list) for (const id of segOrder) out[id] += o.m.segments[id] * n;
+      return out;
+    };
+    const instances = (r) => (r.o.id === 'attention' ? cur.counts[r.t] : r.o.id === 'ln_f' || r.o.id === 'lm_head' ? 1 : P.layers);
+    const segs = sumSegs(rows.map((r) => [r.o, instances(r)]));
+    const baseOf = (r) => {
+      if (!base) return null;
+      if (r.key === 'attention') return base.res[r.t].find((x) => x.id === 'attention');
+      return base.head.find((x) => x.id === r.key) || base.res.global.find((x) => x.id === r.key);
+    };
+    const baseInst = (r) => (r.key === 'attention' ? base.counts[r.t] : r.t === '' && (r.key === 'ln_f' || r.key === 'lm_head') ? 1 : BP.layers);
+    const baseTot = (r) => { const o = baseOf(r); return o ? o.tc * baseInst(r) : 0; };
+    let baseSegs = null;
+    if (base) {
+      baseSegs = Object.fromEntries(segOrder.map((id) => [id, 0]));
+      for (const r of rows) { const o = baseOf(r), n = baseInst(r); if (o) for (const id of segOrder) baseSegs[id] += o.m.segments[id] * n; }
+    }
+    const scale = Math.max(rows[0].tot, ...(base ? rows.map(baseTot) : [0]));
     const hz = HW.clock_mhz * 1e6;
+    const rowName = (r) => (r.key === 'attention' ? (P.alternating ? 'attn ' + r.t : 'attention') : r.key) + (instances(r) > 1 ? ' ×' + instances(r) : '');
+    const peakCell = (r, res) => {
+      const m = r.o.m, u = m.used[res.id];
+      if (u == null) return null;
+      return (u / m.total_cycles) / m.peak_rate[res.id];
+    };
+    const ratioCell = (r, res) => {
+      const m = r.o.m, q = m.required[res.id], u = m.used[res.id];
+      return q > 0 && u != null ? u / q : null;
+    };
+    const maxRatio = Math.max(1.0001, ...rows.flatMap((r) => RESOURCES.map((res) => ratioCell(r, res) || 0)));
+    const violet = (a) => `background:rgba(167,139,250,${(a * 0.8).toFixed(3)})`;
+    const gridCell = (r, res) => {
+      if (S.grid === 'achieved') {
+        const v = peakCell(r, res);
+        if (v == null) return '<span class="gc">—</span>';
+        if (v === 0) return '<span class="gc">0</span>';
+        const num = v * 100 >= 10 ? (v * 100).toFixed(0) : (v * 100).toFixed(1);
+        return `<span class="gc" style="${violet(Math.min(1, v))}">${num}</span>`;
+      }
+      const v = ratioCell(r, res);
+      if (v == null) return '<span class="gc">—</span>';
+      return `<span class="gc" style="${violet(Math.min(1, (v - 1) / (maxRatio - 1)))}">×${f3(v)}</span>`;
+    };
     $('right').innerHTML = `
-      <section class="popup grow" aria-label="Overall estimate">
-        <div class="kpis">
-          <div class="kpi${S.phase === 'prefill' ? ' on' : ''}"><div class="small muted">Prefill · ${seq} tok</div><div class="v">${T(pre.total)}</div><div class="small muted">${(seq / (pre.total / hz)).toFixed(1)} tok/s</div></div>
-          <div class="kpi${S.phase === 'decode' ? ' on' : ''}"><div class="small muted">Decode · ctx ${seq}</div><div class="v">${T(dec.total)}</div><div class="small muted">${(hz / dec.total).toFixed(2)} tok/s</div></div>
+      <section class="popup grow" aria-label="Model">
+        <div class="ph">
+          <div class="ph-top"><span class="ph-big">${base ? f3(base.total) + ' → ' : ''}${f3(cur.total)} cycles${base ? ` <small>×${(cur.total / base.total).toFixed(2)}</small>` : ''}</span><span class="ph-time">${t3(cur.total, HW)}</span></div>
+          <div class="ph-sub">${S.phase === 'decode' ? (hzFmt(hz / cur.total)) + ' tok/s' : 'latency ' + t3(cur.total, HW)}</div>
         </div>
-        <div class="stack" role="img" aria-label="${esc(mix.map((m) => m.label + ' ' + pct(m.w)).join(', '))}">${mix.map((m) => `<div style="width:${(m.w * 100).toFixed(2)}%;background:${m.color}"></div>`).join('')}</div>
-        <div class="grid2">${mix.map((m) => `<div class="sw-row"><span class="sw" style="background:${m.color}"></span><span style="flex-grow:1">${m.label}</span><span class="mono">${pct(m.w)}</span></div>`).join('')}</div>
-        ${rows.map((r) => {
-          const sh = r.tot / cur.total, B = BOUNDS[r.o.bound];
-          return `<button type="button" class="rank-row" data-sel="${r.key}" data-layer-set="${r.t}">
-            <span class="top"><span class="lbl">${esc(r.label)}</span><span class="mono small" style="color:var(--text-2)">${T(r.tot)}</span><span class="mono small muted" style="width:44px;text-align:right">${pct(sh)}</span></span>
-            <span class="track"><span style="width:${(sh / maxShare * 100).toFixed(1)}%;background:${B.color}"></span></span></button>`;
-        }).join('')}
+        <div class="sec">Time by segment</div>
+        ${base
+          ? `<div class="two">${donut(baseSegs, base.total, 190, 160, 30, true)}${donut(segs, cur.total, 190, 160, 30, true)}</div>`
+          : donut(segs, cur.total, 380, 190, 56)}
+        <div class="sec-row"><div class="sec">Modules by time</div><div class="seg mini">${segHTML([['abs', 'Cycles'], ['pct', '100%']], S.bars, 'bars')}</div></div>
+        <div class="mods">${rows.map((r) => {
+          const w = S.bars === 'abs' ? r.tot / scale * 100 : 100;
+          const bw = base && S.bars === 'abs' ? baseTot(r) / scale * 100 : null;
+          return `<button type="button" class="mod" data-sel="${r.key}" data-layer-set="${r.t}">
+            <span class="mn">${esc(rowName(r))}</span>
+            <span class="mb"><span class="mf" style="width:${w.toFixed(2)}%">${barSegs(r.o.m.segments, r.o.m.total_cycles)}</span>${bw != null ? `<span class="mo" style="width:${bw.toFixed(2)}%"></span>` : ''}</span>
+            <span class="mv">${f3(r.tot)}</span><span class="mv mp">${p2(r.tot / cur.total)}</span></button>`;
+        }).join('')}</div>
+        <div class="sec-row"><div class="sec">${S.grid === 'achieved' ? 'Achieved %, over module' : 'Used ÷ required'}</div><div class="seg mini">${segHTML([['achieved', 'Achieved'], ['ratio', 'Used ÷ req']], S.grid, 'grid')}</div></div>
+        <div class="ugrid">
+          <div class="ug head"><span></span>${RESOURCES.map((res) => `<span class="gh">${res.short(HW)}</span>`).join('')}</div>
+          ${rows.map((r) => `<button type="button" class="ug" data-sel="${r.key}" data-layer-set="${r.t}"><span class="mn">${esc(rowName(r))}</span>${RESOURCES.map((res) => gridCell(r, res)).join('')}</button>`).join('')}
+        </div>
       </section>`;
   } else {
     const inHead = cur.head.find((o) => o.id === sel);
     const o = inHead || layer.find((x) => x.id === sel);
     const n = inHead ? 1 : ncount(o);
-    const B = BOUNDS[o.bound];
-    const stats = [
-      [inHead ? 'Time' : 'Time / layer', T(o.tc)],
-      [`In model (×${n})`, `${T(o.tc * n)} · ${pct(o.tc * n / cur.total)}`],
-      ['Kernel cycles', fmtC(o.kc)], ['Shape', o.shape]
-    ];
-    const resources = [
-      ['compute', o.engine === 'VME' ? 'VME array' : 'RVV vector', fmtC(o.ops) + ' ops', o.peak.toFixed(1) + ' ops/cyc', fmtC(o.busy.compute) + ' cyc'],
-      ['dtcm', 'DTCM ↔ core', fmtB(o.dtcm), HW.dbus + ' B/cyc', fmtC(o.busy.dtcm) + ' cyc'],
-      ['host', HW.ext ? 'HyperRAM DMA' : 'Host AXI', fmtB(o.host), HW.host_bw.toFixed(2) + ' B/cyc', fmtC(o.busy.host) + ' cyc'],
-      ['latency', 'Kernel overhead', fmtC(o.busy.latency) + ' cyc', '—', 'not at a roof']
-    ];
-    const lg = (v) => Math.log10(Math.max(1e-6, v));
-    const rx = (x) => Math.min(348, Math.max(44, 44 + (lg(x) + 2) / 5 * 304));
-    const ry = (y) => Math.min(200, Math.max(12, 200 - (lg(y) + 2) / 4 * 188));
-    const pV = 2048 / HW.vme_step, pR = 32768 / L.rvvTile;
-    const pts = all.filter((p) => p !== o).map((p) =>
-      `<span class="pt" title="${p.id}" style="left:${rx(p.ops / p.dtcm) - 4}px;top:${ry(p.ops / p.kc) - 4}px;width:8px;height:8px;background:#aab3c0;border:1px solid #2c323c"></span>`).join('') +
-      `<span class="pt" title="${o.id}" style="left:${rx(o.ops / o.dtcm) - 7}px;top:${ry(o.ops / o.kc) - 7}px;width:14px;height:14px;background:${B.color};border:2px solid #f5f7fa"></span>`;
-    const gx = [44, 104.8, 165.6, 226.4, 287.2, 348], gy = [12, 59, 106, 153, 200];
+    const m = o.m;
+    const share = m.total_cycles * n / cur.total;
+    const bo = base && (base.head.find((x) => x.id === sel) || base.res[lt].find((x) => x.id === sel));
+    const shown = segOrder.filter((id) => m.segments[id] > 0);
+    const BAR_W = 382;
+    const label = (id) => `${segName(id)} ${f3(m.segments[id])}`;
+    const fits = (id) => label(id).length * 6.3 + 6 <= BAR_W * m.segments[id] / m.total_cycles;
+    const spill = shown.filter((id) => !fits(id));
+    const hasActive = RESOURCES.some((r) => m.active_cycles[r.id] != null);
+    const rowsHTML = RESOURCES.map((r) => {
+      const u = m.used[r.id], q = m.required[r.id], peak = m.peak_rate[r.id];
+      const den = m.active_cycles[r.id] != null ? m.active_cycles[r.id] : m.total_cycles;
+      const rate = u == null ? null : u / den;
+      const a = rate == null ? null : rate / peak;
+      const x = q > 0 && u != null ? (u / q).toFixed(1) : null;
+      return `<div class="rt${!u ? ' zero' : ''}">
+        <span class="rn"><span class="dot" style="background:${r.color}"></span>${esc(r.name(HW))}</span>
+        <span class="num">${f3(peak)}<small>${r.rate}</small></span>
+        <span class="num">${rate == null ? '—' : rate === 0 ? '0' : f3(rate)}${rate ? `<small>${r.rate}</small>` : ''}
+          <span class="ach"><span class="ab"><span style="width:${(Math.min(1, a || 0) * 100).toFixed(1)}%;background:${r.color}"></span></span><span>${p2(a)}</span></span></span>
+        <span class="num">${amount(r, q)}</span>
+        <span class="num">${amount(r, u)}${x && x !== '1.0' ? `<small>×${x}</small>` : ''}</span>
+      </div>`;
+    }).join('');
     $('right').innerHTML = `
-      <section class="popup grow" aria-label="Block stats">
-        <div class="roof">
-          <svg width="348" height="232" viewBox="0 0 352 232" role="img" aria-label="Roofline: this block against the VME and RVV ceilings">
-            <g stroke="#4a5361">${gx.map((x) => `<line x1="${x}" y1="12" x2="${x}" y2="200"/>`).join('')}${gy.map((y) => `<line x1="44" y1="${y}" x2="348" y2="${y}"/>`).join('')}</g>
-            <g font-family="IBM Plex Mono, monospace" font-size="11" fill="#dde2e9">
-              ${['0.01', '0.1', '1', '10', '100', '1k'].map((t, i) => `<text x="${gx[i]}" y="214" text-anchor="${i === 5 ? 'end' : 'middle'}">${t}</text>`).join('')}
-              ${['100', '10', '1', '0.1', '0.01'].map((t, i) => `<text x="38" y="${gy[i] + 3}" text-anchor="end">${t}</text>`).join('')}
-              <text x="196" y="230" text-anchor="middle">ops per DTCM↔core byte</text></g>
-            <path d="M${rx(0.01)} ${ry(HW.dbus * 0.01)} L${rx(pV / HW.dbus)} ${ry(pV)} L348 ${ry(pV)}" fill="none" stroke="#f5f7fa" stroke-width="1.6"/>
-            <path d="M${rx(pR / HW.dbus)} ${ry(pR)} L348 ${ry(pR)}" fill="none" stroke="#f5f7fa" stroke-width="1.2" stroke-dasharray="4 3"/>
-            <text x="346" y="${ry(pV) + 12}" text-anchor="end" font-size="11" fill="#f5f7fa" font-family="IBM Plex Sans, sans-serif">VME peak ${pV.toFixed(1)}</text>
-            <text x="346" y="${ry(pR) - 4}" text-anchor="end" font-size="11" fill="#f5f7fa" font-family="IBM Plex Sans, sans-serif">RVV peak ${pR.toFixed(2)}</text>
-          </svg>${pts}
+      <section class="popup grow" aria-label="${esc(o.id)}">
+        <div class="chrome"><b class="mono">${esc(o.id)}</b><button type="button" class="icon-btn" data-act="clear" aria-label="Close">✕</button></div>
+        <div class="ph">
+          <div class="ph-top"><span class="ph-big">${bo ? f3(bo.m.total_cycles) + ' → ' : ''}${f3(m.total_cycles)} cycles</span><span class="ph-time">${t3(m.total_cycles, HW)}</span></div>
+          <div class="ph-sub">${esc(m.shape)} · ×${n} · ${p2(share)} of model${o.flag ? ' · scaled' : ''}</div>
         </div>
-        <div class="sel-line"><b class="mono">${o.id}</b><span class="sw" style="background:${B.color}"></span><span class="small" style="flex-grow:1;color:var(--text-2)">${B.label} · ${o.engine}</span>
-          <button type="button" class="icon-btn" data-act="clear" aria-label="Close">✕</button></div>
-        <div class="res">
-          <div class="res-row res-head"><span>Resource</span><span>Demand</span><span>Capacity</span><span class="u">Util</span></div>
-          ${resources.map(([k, name, demand, cap, sub]) => {
-            const u = Math.min(1, o.busy[k] / o.tc);
-            return `<div class="res-row${k === o.bound ? ' hot' : ''}"><span class="n">${name}<small>${sub}</small></span><span class="mono">${demand}</span><span class="mono">${cap}</span><span class="mono u">${pct(u)}</span>
-              <span class="track"><span style="width:${(u * 100).toFixed(1)}%;background:${BOUNDS[k].color}"></span></span></div>`;
-          }).join('')}
+        <div>
+          <div class="tbar">${barSegs(m.segments, m.total_cycles)}</div>
+          <div class="tlabels">${shown.map((id) => `<span style="width:${(m.segments[id] / m.total_cycles * 100).toFixed(3)}%">${fits(id) ? label(id) : ''}</span>`).join('')}</div>
+          ${spill.length ? `<div class="tspill">${spill.map((id) => `<span><span class="dot" style="background:${segColor(id)}"></span>${label(id)}</span>`).join('')}</div>` : ''}
         </div>
-        <div class="stats">${stats.map(([k, v]) => `<div><span class="k">${k}</span><span class="v">${esc(v)}</span></div>`).join('')}</div>
-        ${o.flag ? `<div class="flag">${esc(o.flagText)}</div>` : ''}
+        <div class="rtw"><div class="rt rh"><span>Resource</span><span class="num">Peak</span><span class="num">${hasActive ? 'Achieved, while active' : 'Achieved, over module'}</span><span class="num">Required</span><span class="num">Used</span></div>${rowsHTML}</div>
       </section>`;
   }
   [...$('right').querySelectorAll('.grow')].forEach((e, i) => { if (scrollKeep[i] != null) e.scrollTop = scrollKeep[i]; });
@@ -617,7 +766,9 @@ document.addEventListener('click', (e) => {
     return;
   }
   const d = b.dataset;
-  if (d.phase) S.phase = d.phase;
+  if (d.bars) S.bars = d.bars;
+  else if (d.grid) S.grid = d.grid;
+  else if (d.phase) S.phase = d.phase;
   else if (d.seq) S.seq = +d.seq;
   else if (d.layer) S.layerType = d.layer;
   else if (d.res) S.res = d.res;
