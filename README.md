@@ -29,7 +29,8 @@ and kernel time not explained by compute or DTCM counts as overhead. The block i
 bound by whichever is largest.
 
 The side panels use one resource list (VME, RVV, DTCM ↔ core, HyperRAM DMA). A
-resource's cycles in the table are the time it would need on its own: used ÷ peak,
+module's engine row shows its measured RTL kernel cycles. Other resources show the
+time they would need on its own, marked ~: used ÷ peak,
 except DTCM, which is accesses × max(c, bytes per access ÷ B), with c = 3.1 cycles
 per access and B = 16 B/cycle. Min cycles use the required amounts. The VME peak is
 the array alone (6.9 cycles per 16×16×4 step), so operand loads count under DTCM.

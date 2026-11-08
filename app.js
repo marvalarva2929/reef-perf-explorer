@@ -265,7 +265,8 @@ function moduleData(o, HW, L, overlap) {
   const used = { [eng]: o.usedOps, [oth]: other, dtcm: o.dtcm, xfer: o.host };
   const required = { [eng]: o.reqOps != null ? o.reqOps : null, [oth]: other, dtcm: bytes, xfer: bytes };
   const peak_rate = { vme: 2048 / VME_ARRAY_STEP, rvv: 32768 / L.rvvTile, dtcm: HW.dbus, xfer: HW.host_bw };
-  const active_cycles = {};
+  // RTL mcycle around the kernel, charged to the engine it runs on.
+  const active_cycles = { [eng]: o.kc };
   const used_accesses = o.dtcmAcc != null ? o.dtcmAcc : o.dtcm / DTCM_WIDEST;
   const bytes_per_access = used_accesses ? o.dtcm / used_accesses : 0;
   const required_accesses = bytes != null ? bytes / DTCM_WIDEST : null;
@@ -275,9 +276,10 @@ function moduleData(o, HW, L, overlap) {
     c, cycles: used_accesses * Math.max(c, bytes_per_access / Bus),
     min_cycles: required_accesses != null ? required_accesses * Math.max(c, DTCM_WIDEST / Bus) : null
   };
-  const cycles = {}, min_cycles = {};
+  const cycles = {}, min_cycles = {}, standalone = {};
   for (const { id } of RESOURCES) {
     const modeled = id === 'dtcm' ? dtcm.cycles : (used[id] == null ? null : used[id] / peak_rate[id]);
+    standalone[id] = modeled;
     cycles[id] = active_cycles[id] != null ? active_cycles[id] : modeled;
     min_cycles[id] = id === 'dtcm' ? dtcm.min_cycles : (required[id] == null ? null : required[id] / peak_rate[id]);
   }
@@ -285,9 +287,9 @@ function moduleData(o, HW, L, overlap) {
   // largest is charged, capped at kernel time; the rest of the kernel is overhead.
   const segments = { vme: 0, rvv: 0, dtcm: 0, xfer: 0, overhead: 0 };
   const pool = overlap ? ['vme', 'rvv', 'dtcm', 'xfer'] : ['vme', 'rvv', 'dtcm'];
-  const top = pool.reduce((x, y) => ((cycles[y] || 0) > (cycles[x] || 0) ? y : x));
+  const top = pool.reduce((x, y) => ((standalone[y] || 0) > (standalone[x] || 0) ? y : x));
   if (!overlap) segments.xfer = o.hc;
-  segments[top] = Math.min(overlap ? o.tc : o.kc, cycles[top] || 0);
+  segments[top] = Math.min(overlap ? o.tc : o.kc, standalone[top] || 0);
   segments.overhead = o.tc - RESOURCES.reduce((a, r) => a + segments[r.id], 0);
   return { total_cycles: o.tc, shape: o.shape, segments, peak_rate, required, used, active_cycles, dtcm, cycles, min_cycles };
 }
@@ -807,7 +809,9 @@ function render() {
       const isD = id === 'dtcm';
       const x = u === 0 ? '0' : cyc != null && mn > 0 ? (cyc / mn).toFixed(1) : '—';
       const usedCell = change((v) => amount(r, v), u, bm && bm.used[id]);
-      const cycCell = change(cycles, cyc, bm && bm.cycles[id]);
+      const isModeled = m.active_cycles[id] == null;
+      const cycFmt = (v) => (isModeled && v > 0 ? '<span class="u">~</span>' : '') + cycles(v);
+      const cycCell = change(cycFmt, cyc, bm && bm.cycles[id]);
       return `<div class="rt${!u ? ' zero' : ''}">
         <span class="rn"><span class="dot" style="background:${r.color}"></span><span>${esc(r.name(HW))}</span></span>
         <span class="num">${withUnit(f3(m.peak_rate[id]), r.rate)}</span>
@@ -836,7 +840,7 @@ function render() {
         </div>
         ${roofline()}
         <div class="tbs">${bm ? timeBar(bm, 'before', barScale) + timeBar(m, 'after', barScale) : timeBar(m, '', barScale)}</div>
-        <div class="rtw"><div class="rt rh"><span>Resource</span><span class="num">Peak</span><span class="num">Used</span><span class="num">Required</span><span class="num">Min cycles</span><span class="num" title="${hasActive ? 'Measured' : 'Modeled'}">Cycles</span><span class="num">×</span></div>${rowsHTML}</div>
+        <div class="rtw"><div class="rt rh"><span>Resource</span><span class="num">Peak</span><span class="num">Used</span><span class="num">Required</span><span class="num">Min cycles</span><span class="num" title="${hasActive ? 'Measured; ~ modeled' : '~ modeled'}">Cycles</span><span class="num">×</span></div>${rowsHTML}</div>
       </section>`;
   }
   [...$('right').querySelectorAll('.grow')].forEach((e, i) => { if (scrollKeep[i] != null) e.scrollTop = scrollKeep[i]; });

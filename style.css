@@ -189,7 +189,7 @@ button.mod:hover, button.ug:hover { background: var(--control); }
 .tspill > span { display: inline-flex; align-items: center; gap: 4px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; display: inline-block; }
 .rtw { overflow-x: auto; display: flex; flex-direction: column; }
-.rt { display: grid; grid-template-columns: 88px 74px 60px 58px 58px 58px 30px; justify-content: space-between; align-items: end; column-gap: 4px; row-gap: 6px; padding: 12px 0 13px; border-top: 1px solid var(--line); font-size: 12px; line-height: 1.35; min-width: 450px; }
+.rt { display: grid; grid-template-columns: 88px 74px 60px 58px 58px 68px 30px; justify-content: space-between; align-items: end; column-gap: 4px; row-gap: 6px; padding: 12px 0 13px; border-top: 1px solid var(--line); font-size: 12px; line-height: 1.35; min-width: 450px; }
 .rt.rh { border-top: 0; padding-top: 0; font-size: 11px; color: var(--muted); align-items: end; }
 .rt.zero, .rt.zero .num small { color: var(--muted); }
 .rn { display: flex; align-items: flex-start; gap: 5px; font-weight: 600; }
