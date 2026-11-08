@@ -43,6 +43,18 @@ const RESULTS = {
     gelu: 7029, residual: 17987
   }
 };
+// coral-npu plus the reef_perf matrix microbenchmarks with A stored transposed
+// (contiguous vle8 operand loads, rtl_matrix.csv, coralnpu 8a5e1b31): 25 cycles
+// per step. mtx_gemm_int8 16x512x16 = 3336; mtx_gemv_int8 1x512x16 = 3235.
+// Attention keeps its own measured streams.
+RESULTS.transposed = {
+  ...RESULTS.coral,
+  label: 'coral-npu + transposed VME',
+  short: 'coral + transposed',
+  date: '2026-10-26',
+  note: 'coral-npu with matmuls at the transposed-A VME cycles. Decode matmuls use the VME GEMV tile.',
+  vmeStep: 25, vmeOverhead: 136, gemvOverhead: 35
+};
 
 // Per-tile shapes and traffic (same across result sets; from model.json tiles).
 const TILE = {
@@ -111,19 +123,22 @@ const cdiv = (a, b) => Math.ceil(a / b);
 const fmtInt = (n) => Math.round(n).toLocaleString('en-US');
 
 function matmul(id, n, k, m, HW, L) {
-  const vme = n % 16 === 0;
-  const tn = vme ? 16 : 1, tk = 512, tm = vme ? 16 : 32;
+  const gemm = n % 16 === 0, gemv = !gemm && L.gemvOverhead != null, vme = gemm || gemv;
+  const over = gemv ? L.gemvOverhead : L.vmeOverhead;
+  const tn = gemm ? 16 : 1, tk = 512, tm = vme ? 16 : 32;
   const chunks = [];
   for (let k0 = 0; k0 < k; k0 += tk) chunks.push(Math.min(tk, k - k0));
   let kc = 0, dt = 0, host = 0;
   const at = cdiv(n, tn), mt = cdiv(m, tm);
   for (const c of chunks) {
-    kc += vme ? L.vmeOverhead + HW.vme_step * c / 4 : L.rvvTile * c / tk;
+    kc += vme ? over + HW.vme_step * c / 4 : L.rvvTile * c / tk;
     dt += vme ? (c / 4) * 128 + tn * tm * 4 : tn * cdiv(tm, 16) * c * 17 + tn * tm * 4;
     host += tn * c + mt * (c * tm + tn * tm * 4);
   }
-  const src = vme
-    ? `vme_matmul_u8 16×512×16 = ${fmtInt(L.vmeOverhead + 84 * 128)} cyc · fit ${L.vmeOverhead} + ${HW.vme_step}·k/4`
+  const src = gemv
+    ? `mtx_gemv_int8 1×512×16 = ${fmtInt(over + HW.vme_step * 128)} cyc · A transposed`
+    : vme
+    ? `${L.vmeStep ? 'mtx_gemm_int8' : 'vme_matmul_u8'} 16×512×16 = ${fmtInt(over + HW.vme_step * 128)} cyc${L.vmeStep ? ' · A transposed' : ''}`
     : `matmul_rvv_s8u8 1×512×32 = ${fmtInt(L.rvvTile)} cyc`;
   return {
     id, engine: vme ? 'VME' : 'RVV', kind: 'matmul · ' + (vme ? 'VME' : 'RVV'),
@@ -275,7 +290,7 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&
 /* --------------------------------------------------------------- state */
 
 const S = {
-  model: 'neo', hw: 'hyperram', res: 'coral', phase: 'decode', seq: 1024, layerType: 'global', sel: null,
+  model: 'neo', hw: 'hyperram', res: 'transposed', phase: 'decode', seq: 1024, layerType: 'global', sel: null,
   p: {}, hwp: {}, whatif: false, zoom: null, fit: 0.9
 };
 
@@ -298,7 +313,9 @@ function writeHash() {
 
 const INTS = new Set(['n_head', 'd_head', 'd_model', 'd_ff', 'layers', 'window', 'vocab']);
 function resolved() {
-  const BP = MODELS[S.model], BH = HARDWARE[S.hw];
+  const L = RESULTS[S.res], BP = MODELS[S.model];
+  // The transposed layout changes the step cost, so that set's step is the file value.
+  const BH = L.vmeStep ? { ...HARDWARE[S.hw], vme_step: L.vmeStep } : HARDWARE[S.hw];
   const apply = (base, over) => {
     const out = Object.assign({}, base);
     for (const k of Object.keys(over)) {
@@ -314,7 +331,7 @@ function resolved() {
     HW.host_bw = HW.hb_mhz * HW.hb_bytes / HW.clock_mhz; // B per core cycle
   }
   BOUNDS.host.label = HW.ext ? 'Memory · HyperRAM' : 'Host transfer';
-  return { P, HW, BP, BH, L: RESULTS[S.res] };
+  return { P, HW, BP, BH, L };
 }
 
 /* -------------------------------------------------------------- render */
@@ -413,7 +430,7 @@ function render() {
       ['hwp', 'dma_overlap', 'DMA overlaps compute', 'bool', 'not stated · 1 outstanding txn']
     ] : [['hwp', 'host_bw', 'Host→DTCM (B/cycle)', 0.5, 'measured · RTL bound 16']]),
     ['hwp', 'dbus', 'DTCM bus (B/cycle)', 4, 'confirmed · 128-bit LSU'],
-    ['hwp', 'vme_step', 'VME cycles / step', 1, 'measured · k-sweep slope']
+    ['hwp', 'vme_step', 'VME cycles / step', 1, L.vmeStep ? 'measured · transposed A' : 'measured · k-sweep slope']
   ];
   let changed = 0;
   const fieldHTML = (f) => {
@@ -496,47 +513,21 @@ function render() {
   $('context-label').textContent = `${P.name} · ${phase}${S.phase === 'prefill' ? ' ' + seq + ' tokens' : ' @ ctx ' + seq} · ${BH.name} · ${L.short}`;
   $('legend').innerHTML = Object.values(BOUNDS).map((b) => `<span><span class="sw" style="background:${b.color}"></span>${b.label}</span>`).join('');
 
-  // ---- right popups
+  // ---- right panel
   const scrollKeep = [...$('right').querySelectorAll('.grow')].map((e) => e.scrollTop);
   if (!sel) {
     const mixAcc = Object.fromEntries(Object.keys(BOUNDS).map((k) => [k, 0]));
-    const moveLine = HW.ext
-      ? `Kernel ${pct(cur.kern / cur.total)} · HyperRAM DMA ${pct(1 - cur.kern / cur.total)} of time. ${fmtB(cur.moved)} moved at ${(HW.hb_mhz * HW.hb_bytes).toFixed(0)} MB/s (${HW.host_bw.toFixed(2)} B/cycle, derived). DMA ${HW.dma_overlap ? 'overlaps compute: each block takes the longer of the two' : 'serialized with compute (overlap not stated)'}.`
-      : `Kernel time ${pct(cur.kern / cur.total)} · host↔DTCM transfer ${pct(1 - cur.kern / cur.total)} (no DMA, serialized)`;
     for (const r of rows) mixAcc[r.o.bound] += r.tot;
     const mix = Object.keys(BOUNDS).map((k) => ({ ...BOUNDS[k], w: mixAcc[k] / cur.total }));
     const hz = HW.clock_mhz * 1e6;
-    // compare against the other result sets
-    const others = Object.keys(RESULTS).map((k) => {
-      const R = RESULTS[k], p2 = run(P, HW, R, seq, seq), d2 = run(P, HW, R, 1, seq);
-      return { k, R, pre: p2.total, dec: d2.total };
-    });
-    const base = others.find((x) => x.k === S.res);
     $('right').innerHTML = `
-      <section class="popup fixed" aria-label="Overall estimate">
-        <div><div class="eyebrow">Overall estimate</div>
-          <div class="small" style="color:var(--text-2)">${esc(P.name)} on ${esc(BH.name)} · ${HW.clock_mhz} MHz · ${esc(L.short)}</div></div>
+      <section class="popup grow" aria-label="Overall estimate">
         <div class="kpis">
           <div class="kpi${S.phase === 'prefill' ? ' on' : ''}"><div class="small muted">Prefill · ${seq} tok</div><div class="v">${T(pre.total)}</div><div class="small muted">${(seq / (pre.total / hz)).toFixed(1)} tok/s</div></div>
           <div class="kpi${S.phase === 'decode' ? ' on' : ''}"><div class="small muted">Decode · ctx ${seq}</div><div class="v">${T(dec.total)}</div><div class="small muted">${(hz / dec.total).toFixed(2)} tok/s</div></div>
         </div>
-        <div style="display:flex;flex-direction:column;gap:6px">
-          <div class="small" style="color:var(--text-2)">What limits ${phase} time</div>
-          <div class="stack" role="img" aria-label="${esc(mix.map((m) => m.label + ' ' + pct(m.w)).join(', '))}">${mix.map((m) => `<div style="width:${(m.w * 100).toFixed(2)}%;background:${m.color}"></div>`).join('')}</div>
-          <div class="grid2">${mix.map((m) => `<div class="sw-row"><span class="sw" style="background:${m.color}"></span><span style="flex-grow:1">${m.label}</span><span class="mono">${pct(m.w)}</span></div>`).join('')}</div>
-        </div>
-        <div style="display:flex;flex-direction:column;gap:4px">
-          <div class="small" style="color:var(--text-2)">Same model on each kernel results set</div>
-          ${others.map((x) => `<button type="button" class="rank-row" data-res="${x.k}" style="min-height:32px;flex-direction:row;align-items:baseline;gap:8px;${x.k === S.res ? 'background:#1f2a40' : ''}">
-            <span class="mono small" style="flex-grow:1">${esc(x.R.short)}</span>
-            <span class="mono small">${T(x.dec)}/tok</span>
-            <span class="mono small muted" style="width:76px;text-align:right">${T(x.pre)}</span></button>`).join('')}
-          <div class="small muted">decode @ ctx ${seq} · prefill ${seq} tokens${base ? '' : ''}</div>
-        </div>
-        <div class="small muted">${esc(moveLine)}</div>
-      </section>
-      <section class="popup grow" aria-label="Where the time goes">
-        <div style="display:flex;align-items:baseline;gap:8px"><div class="eyebrow" style="flex-grow:1">Where the time goes · ${phase}</div><span class="mono small" style="color:var(--text-2)">${T(cur.total)}</span></div>
+        <div class="stack" role="img" aria-label="${esc(mix.map((m) => m.label + ' ' + pct(m.w)).join(', '))}">${mix.map((m) => `<div style="width:${(m.w * 100).toFixed(2)}%;background:${m.color}"></div>`).join('')}</div>
+        <div class="grid2">${mix.map((m) => `<div class="sw-row"><span class="sw" style="background:${m.color}"></span><span style="flex-grow:1">${m.label}</span><span class="mono">${pct(m.w)}</span></div>`).join('')}</div>
         ${rows.map((r) => {
           const sh = r.tot / cur.total, B = BOUNDS[r.o.bound];
           return `<button type="button" class="rank-row" data-sel="${r.key}" data-layer-set="${r.t}">
@@ -549,36 +540,13 @@ function render() {
     const o = inHead || layer.find((x) => x.id === sel);
     const n = inHead ? 1 : ncount(o);
     const B = BOUNDS[o.bound];
-    const reasons = {
-      compute: `Runs at ${pct(o.cu)} of the measured ${o.engine} peak (${o.peak.toFixed(1)} ops/cycle). Only more ${o.engine} throughput or fewer ops moves it.`,
-      dtcm: `The DTCM bus is ${pct(o.du)} busy at ${HW.dbus} B/cycle. A wider bus or better reuse moves it.`,
-      host: HW.ext
-        ? `Moving ${fmtB(o.host)} over the HyperRAM DMA (${fmtC(o.hc)} cycles at ${HW.host_bw.toFixed(2)} B/cycle) takes longer than the kernel (${fmtC(o.kc)}). ${HW.dma_overlap ? 'With overlap the transfer sets the time.' : 'It is serialized with the kernel.'} More HyperRAM bandwidth or tile reuse moves it.`
-        : `Host↔DTCM transfer (${fmtC(o.hc)} cycles) is longer than the kernel (${fmtC(o.kc)}). No DMA, so it is not overlapped.`,
-      latency: `Neither roof is close: ${pct(o.cu)} of ${o.engine} peak, ${pct(o.du)} of DTCM bandwidth. Time goes to loop overhead, scalar work and load-use stalls — a kernel-side fix.`
-    };
     const stats = [
       [inHead ? 'Time' : 'Time / layer', T(o.tc)],
       [`In model (×${n})`, `${T(o.tc * n)} · ${pct(o.tc * n / cur.total)}`],
-      ['Shape', o.shape], ['Tiles / launches', fmtInt(o.tiles)],
       ['Kernel cycles', fmtC(o.kc)], [XF + ' cycles', fmtC(o.hc)],
       ['DTCM↔core bytes', fmtB(o.dtcm)], [XF + ' bytes', fmtB(o.host)],
-      ['Ops (2·MAC)', fmtC(o.ops)], ['Attained', (o.ops / o.kc).toFixed(2) + ' ops/cyc'],
-      ['Intensity', (o.ops / o.dtcm).toFixed(2) + ' ops/B'], ['Engine', `${o.engine} · peak ${o.peak.toFixed(1)}`]
+      ['Shape', o.shape], ['Attained', `${(o.ops / o.kc).toFixed(2)} of ${o.peak.toFixed(1)} ops/cyc`]
     ];
-    const meters = [
-      [o.engine + ' compute peak', Math.min(1, o.cu), BOUNDS.compute.color],
-      ['DTCM bus bandwidth', Math.min(1, o.du), BOUNDS.dtcm.color],
-      [(HW.ext ? 'HyperRAM DMA' : 'Host transfer') + ' share of block time', o.hu, BOUNDS.host.color]
-    ];
-    // same block across result sets
-    const across = Object.keys(RESULTS).map((k) => {
-      const r2 = run(P, HW, RESULTS[k], S.phase === 'prefill' ? seq : 1, seq);
-      const o2 = inHead ? r2.head.find((x) => x.id === sel) : r2.res[lt].find((x) => x.id === sel);
-      return { k, short: RESULTS[k].short, tc: o2.tc, bound: o2.bound };
-    });
-    const maxA = Math.max(...across.map((a) => a.tc));
-    // roofline
     const lg = (v) => Math.log10(Math.max(1e-6, v));
     const rx = (x) => Math.min(348, Math.max(44, 44 + (lg(x) + 2) / 5 * 304));
     const ry = (y) => Math.min(200, Math.max(12, 200 - (lg(y) + 2) / 4 * 188));
@@ -588,20 +556,7 @@ function render() {
       `<span class="pt" title="${o.id}" style="left:${rx(o.ops / o.dtcm) - 7}px;top:${ry(o.ops / o.kc) - 7}px;width:14px;height:14px;background:${B.color};border:2px solid #e8eaed"></span>`;
     const gx = [44, 104.8, 165.6, 226.4, 287.2, 348], gy = [12, 59, 106, 153, 200];
     $('right').innerHTML = `
-      <section class="popup fixed sel-card" aria-label="Block stats">
-        <div style="height:5px;background:${B.color}"></div>
-        <div class="inner">
-          <div class="sel-head"><div style="flex-grow:1"><div class="eyebrow">${inHead ? 'Output head · ' + phase : (o.id === 'attention' && P.alternating ? lt + ' layers · ' : 'every layer · ') + phase}</div><h2>${o.id}</h2></div>
-            <button type="button" class="btn sm" data-act="clear">✕ Overview</button></div>
-          <div class="small" style="color:var(--text-2);font-size:13px">${DESCS[o.id]}</div>
-          <div class="bound-box"><div style="display:flex;align-items:center;gap:8px"><span class="sw" style="width:12px;height:12px;border-radius:3px;background:${B.color}"></span><b>${B.label}</b></div>
-            <div class="small" style="color:var(--text-2)">${esc(reasons[o.bound])}</div></div>
-          <div class="stats">${stats.map(([k, v]) => `<div><span class="k">${k}</span><span class="v">${esc(v)}</span></div>`).join('')}</div>
-        </div>
-      </section>
-      <section class="popup grow" aria-label="Block limits">
-        <div class="eyebrow">How close to each limit</div>
-        ${meters.map(([l, v, c]) => `<div class="meter" style="display:flex;flex-direction:column;gap:3px"><div style="display:flex;justify-content:space-between" class="small"><span style="color:var(--text-2)">${l}</span><span class="mono">${pct(v)}</span></div><span class="track"><span style="width:${(v * 100).toFixed(1)}%;background:${c}"></span></span></div>`).join('')}
+      <section class="popup grow" aria-label="Block stats">
         <div class="roof">
           <svg width="348" height="232" viewBox="0 0 352 232" role="img" aria-label="Roofline: this block against the VME and RVV ceilings">
             <g stroke="#262a31">${gx.map((x) => `<line x1="${x}" y1="12" x2="${x}" y2="200"/>`).join('')}${gy.map((y) => `<line x1="44" y1="${y}" x2="348" y2="${y}"/>`).join('')}</g>
@@ -611,19 +566,14 @@ function render() {
               <text x="196" y="230" text-anchor="middle">ops per DTCM↔core byte</text></g>
             <path d="M${rx(0.01)} ${ry(HW.dbus * 0.01)} L${rx(pV / HW.dbus)} ${ry(pV)} L348 ${ry(pV)}" fill="none" stroke="#e8eaed" stroke-width="1.6"/>
             <path d="M${rx(pR / HW.dbus)} ${ry(pR)} L348 ${ry(pR)}" fill="none" stroke="#e8eaed" stroke-width="1.2" stroke-dasharray="4 3"/>
-            <text x="346" y="${ry(pV) - 4}" text-anchor="end" font-size="10" fill="#e8eaed" font-family="IBM Plex Sans, sans-serif">VME peak ${pV.toFixed(1)}</text>
+            <text x="346" y="${ry(pV) + 12}" text-anchor="end" font-size="10" fill="#e8eaed" font-family="IBM Plex Sans, sans-serif">VME peak ${pV.toFixed(1)}</text>
             <text x="346" y="${ry(pR) - 4}" text-anchor="end" font-size="10" fill="#e8eaed" font-family="IBM Plex Sans, sans-serif">RVV peak ${pR.toFixed(2)}</text>
           </svg>${pts}
         </div>
-        <div class="small muted">y: attained ops/cycle, kernel only. Grey dots: the other blocks in this view.</div>
-        <div style="display:flex;flex-direction:column;gap:6px">
-          <div class="eyebrow">This block on each result set</div>
-          ${across.map((a) => `<div style="display:flex;flex-direction:column;gap:3px"><div class="small" style="display:flex;justify-content:space-between;${a.k === S.res ? 'color:var(--text)' : 'color:var(--text-2)'}"><span class="mono">${esc(a.short)}${a.k === S.res ? ' ·  current' : ''}</span><span class="mono">${T(a.tc)}</span></div><span class="track"><span style="width:${(a.tc / maxA * 100).toFixed(1)}%;background:${BOUNDS[a.bound].color}"></span></span></div>`).join('')}
-        </div>
-        <div class="src"><div class="small" style="font-weight:600">Measured source · ${esc(L.short)}</div>
-          ${o.engine === 'VME' ? '<div class="small muted">VME cycles stand in for the 16×16 systolic array (assumed the same unit).</div>' : ''}
-          <div class="mono small" style="color:var(--text-2)">${esc(o.src)}</div>
-          ${o.flag ? `<div class="flag">${esc(o.flagText)}</div>` : ''}</div>
+        <div class="sel-line"><b class="mono">${o.id}</b><span class="sw" style="background:${B.color}"></span><span class="small" style="flex-grow:1;color:var(--text-2)">${B.label} · ${o.engine}</span>
+          <button type="button" class="icon-btn" data-act="clear" aria-label="Close">✕</button></div>
+        <div class="stats">${stats.map(([k, v]) => `<div><span class="k">${k}</span><span class="v">${esc(v)}</span></div>`).join('')}</div>
+        ${o.flag ? `<div class="flag">${esc(o.flagText)}</div>` : ''}
       </section>`;
   }
   [...$('right').querySelectorAll('.grow')].forEach((e, i) => { if (scrollKeep[i] != null) e.scrollTop = scrollKeep[i]; });

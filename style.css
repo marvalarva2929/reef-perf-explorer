@@ -155,3 +155,4 @@ select { max-width: 200px; font-size: 12px; }
   .app { width: 100vw; }
 }
 .wf input.chk { width: 20px; height: 20px; min-height: 0; accent-color: var(--accent); }
+.sel-line { display: flex; align-items: center; gap: 8px; }

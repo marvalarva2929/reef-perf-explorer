@@ -63,6 +63,7 @@ attention for those models as a rough estimate.
 | `sim 376cd28+` (2026-10-20) | `feature/inference-engine-simulation`, RESULTS.md | 0.96 s / 2.37 min |
 | `coral-npu 5fb006c+` (2026-10-21) | `feature/coral-npu-kernels`, RESULTS.md: every integer loop vectorized | 0.76 s / 1.35 min |
 | `stash 4d1a0d9+` (2026-10-22) | unpushed stash on the simulation branch: vectorized pointwise and softmax | 0.75 s / 1.14 min |
+| `coral + transposed` (default) | `coral-npu 5fb006c+` with matmuls at the `reef_perf/rtl_matrix.csv` microbenchmarks, A stored transposed (coralnpu 8a5e1b31): GEMM 16×512×16 = 3,336 cycles, GEMV 1×512×16 = 3,235, 25 cycles per step. Decode matmuls use the VME GEMV tile instead of RVV. Attention keeps its measured streams | |
 
 Cycles are from Coral's `VmeCoreMiniAxi` RTL (cocotb + Verilator, coralnpu
 382b5c12). The `sim 376cd28+` set only logs attention stream totals, so its
