@@ -377,7 +377,13 @@ function t3(cyc, HW) {
   if (ms >= 1000) return f3(ms / 1000) + ' s';
   return f3(ms) + ' ms';
 }
-const amount = (r, v) => (v == null ? '—' : v === 0 ? '0' : r.unit === 'ops' ? f3(v) : fB2(v).replace(/ ?(K|M|G)?B$/, '$1'));
+const withUnit = (s, u) => (s === '—' ? s : `${s}<span class="u">${u}</span>`);
+const amount = (r, v) => {
+  if (r.unit === 'ops') return withUnit(f3(v), 'ops');
+  if (v === 0) return withUnit('0', 'B');
+  const [n, u] = fB2(v).split(' ');
+  return withUnit(n, u);
+};
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 /* --------------------------------------------------------------- state */
@@ -798,21 +804,31 @@ function render() {
       const b = fmt(was);
       return a === b ? a : `<small class="was">${b} →</small>${a}`;
     };
-    const acc = (v) => f3(v);
+    const acc = (v) => withUnit(f3(v), 'acc');
+    const cycles = (v) => withUnit(f3(v), 'cyc');
+    const blank = '<span></span>';
     const rowsHTML = RESOURCES.map((r) => {
       const id = r.id, u = m.used[id], q = m.required[id], cyc = m.cycles[id], mn = m.min_cycles[id];
       const isD = id === 'dtcm';
       const x = u === 0 ? '0' : cyc != null && mn > 0 ? (cyc / mn).toFixed(1) : '—';
       const usedCell = change((v) => amount(r, v), u, bm && bm.used[id]);
-      const cycCell = change(f3, cyc, bm && bm.cycles[id]);
+      const cycCell = change(cycles, cyc, bm && bm.cycles[id]);
       return `<div class="rt${!u ? ' zero' : ''}">
-        <span class="rn"><span class="dot" style="background:${r.color}"></span><span>${esc(r.name(HW))}${isD ? '<small class="l2">accesses</small>' : ''}</span></span>
-        <span class="num">${f3(m.peak_rate[id])}${isD ? `<span class="l2">${m.dtcm.c}</span>` : ''}</span>
-        <span class="num">${usedCell}${isD ? `<span class="l2">${change(acc, m.dtcm.used_accesses, bm && bm.dtcm.used_accesses)}</span><small>${f3(m.dtcm.bytes_per_access)}</small>` : ''}</span>
-        <span class="num">${amount(r, q)}${isD ? `<span class="l2">${acc(m.dtcm.required_accesses)}</span>` : ''}</span>
-        <span class="num">${f3(mn)}</span>
+        <span class="rn"><span class="dot" style="background:${r.color}"></span><span>${esc(r.name(HW))}</span></span>
+        <span class="num">${withUnit(f3(m.peak_rate[id]), r.rate)}</span>
+        <span class="num">${usedCell}</span>
+        <span class="num">${amount(r, q)}</span>
+        <span class="num">${cycles(mn)}</span>
         <span class="num">${cycCell}</span>
         <span class="num">${x}</span>
+        ${isD ? `<span class="rs">accesses</span>
+        <span class="num">${withUnit(String(m.dtcm.c), 'cyc/acc')}</span>
+        <span class="num">${change(acc, m.dtcm.used_accesses, bm && bm.dtcm.used_accesses)}</span>
+        <span class="num">${acc(m.dtcm.required_accesses)}</span>
+        ${blank.repeat(3)}
+        <span class="rs">bytes per access</span>${blank}
+        <span class="num dim">${withUnit(f3(m.dtcm.bytes_per_access), 'B/acc')}</span>
+        ${blank.repeat(4)}` : ''}
         <span class="cbar"><span style="width:${((cyc || 0) / maxCyc * 100).toFixed(2)}%;background:${r.color}"></span>${mn != null ? `<i style="left:${Math.min(100, mn / maxCyc * 100).toFixed(2)}%"></i>` : ''}</span>
       </div>`;
     }).join('');
@@ -825,7 +841,7 @@ function render() {
         </div>
         ${roofline()}
         <div class="tbs">${bm ? timeBar(bm, 'before', barScale) + timeBar(m, 'after', barScale) : timeBar(m, '', barScale)}</div>
-        <div class="rtw"><div class="rt rh"><span>Resource</span><span class="num">Peak<small>ops/cyc</small><small>B/cyc</small><small>cyc/acc</small></span><span class="num">Used<small>ops · B</small><small>acc · B/acc</small></span><span class="num">Required<small>ops · B</small><small>acc</small></span><span class="num">Min cycles<small>cyc</small></span><span class="num">${hasActive ? 'Cycles, measured' : 'Cycles, modeled'}<small>cyc</small></span><span class="num">×</span></div>${rowsHTML}</div>
+        <div class="rtw"><div class="rt rh"><span>Resource</span><span class="num">Peak</span><span class="num">Used</span><span class="num">Required</span><span class="num">Min cycles</span><span class="num" title="${hasActive ? 'Measured' : 'Modeled'}">Cycles</span><span class="num">×</span></div>${rowsHTML}</div>
       </section>`;
   }
   [...$('right').querySelectorAll('.grow')].forEach((e, i) => { if (scrollKeep[i] != null) e.scrollTop = scrollKeep[i]; });
