@@ -75,32 +75,46 @@ const MODELS = {
   ts1m: tinyStories('TinyStories-1M', 64, 8),
   ts3m: tinyStories('TinyStories-3M', 128, 8),
   ts8m: tinyStories('TinyStories-8M', 256, 8),
-  neo: { label: 'TinyStories-28M', file: 'gpt_neo_28m.json', name: 'gpt-neo-28m', n_head: 16, d_head: 32, d_model: 512, d_ff: 2048, layers: 8, window: 256, vocab: 50257, n_ctx: 2048, alternating: true, assumed: { n_head: '16 (TinyStories HF configs)' } },
-  ts33m: tinyStories('TinyStories-33M', 768, 4),
-  gpt2: { label: 'GPT-2 small', file: 'model.json', name: 'gpt2-small', n_head: 12, d_head: 64, d_model: 768, d_ff: 3072, layers: 12, window: 1024, vocab: 50257, n_ctx: 1024, alternating: false, assumed: {} }
+  ts28m: tinyStories('TinyStories-28M', 512, 8),
+  ts33m: tinyStories('TinyStories-33M', 768, 4)
 };
 
-// hyperram: the SoC architecture (lhs-soc.vercel.app/architecture, soc.yaml).
-// Weights, KV cache and spilled activations live in external HyperRAM; one DMA
-// channel moves tiles between it and the Coral core's TCMs (one outstanding
-// transaction). The site gives no bandwidth: the controller's [10:0] external
-// interface matches an x8 HyperBus (DQ[7:0], RWDS, CK, CS#), which moves 2 B
-// per bus clock (DDR); the bus clock defaults to the core clock. Whether DMA
-// overlaps compute is not stated, so it defaults to serialized.
+// xspi: the RTL team's data path (2026-11). Weights and, for now, the KV cache
+// in XSPI flash (16 bit per XSPI clock, ~6 ns); one DMA channel into the 32 KB
+// DTCM, double buffered so transfers overlap compute; the host boots the 8 KB
+// ITCM over SPI (1 bit/cycle). XSPI clock assumed equal to the 50 MHz core.
 const HARDWARE = {
-  hyperram: {
-    label: 'atlas · HyperRAM + DMA', file: 'soc.yaml (atlas)', name: 'HyperRAM via DMA', clock_mhz: 50, dbus: 16, vme_step: 84,
-    clockConfirmed: false, dtcm_c: 3.1, ext: true, hb_mhz: 50, hb_bytes: 2, dma_overlap: 0
-  },
-  a0: { label: 'hardware.json · host AXI', file: 'hardware.json', name: 'host AXI, no DMA', clock_mhz: 50, host_bw: 15.745, dbus: 16, vme_step: 84, clockConfirmed: false, dtcm_c: 3.1, ext: false }
+  xspi: {
+    label: 'reef-perf · XSPI + DMA', file: 'reef-perf a660183', name: 'XSPI flash via DMA', clock_mhz: 50, dbus: 16, vme_step: 84,
+    clockConfirmed: false, dtcm_c: 3.1, ext: true, hb_mhz: 50, hb_bytes: 2, dma_overlap: 1
+  }
 };
+
+// Measured end to end on reef-perf (yuvesh-kernel-integration a660183: M3 core,
+// Zvt matrix engine, DMA, host boot) with the e2e-npu-firmware branch
+// (inference-engine/coral/e2e): the whole model streamed from XSPI, 16-token
+// prompt, 2 new tokens. [XSPI bytes per core cycle, prefill cycles (16-token
+// prompt + first token), decode cycles per token]. Cycle counts only.
+const MEASURED = {
+  ts1m: [[0.25, 16266085, 16518735], [0.5, 8582021, 8834159], [1, 4802093, 5055127], [2, 3282651, 3527437], [4, 3230142, 3472328], [8, 3229758, 3472056]],
+  ts3m: [[0.25, 34329182, 34614552], [0.5, 17829134, 18105104], [1, 9783022, 10044400], [2, 6322293, 6530055], [4, 6268661, 6466671], [8, 6267893, 6466127]],
+  ts8m: [[0.25, 80015810, 80368092], [0.5, 41168346, 41493060], [1, 22236695, 22515841], [2, 13863551, 13883441], [4, 13809168, 13809706], [8, 13807632, 13808618]],
+  ts28m: [[0.25, 313936053, 209938970], [0.5, 161003242, 107469119], [1, 86542570, 57206647], [2, 53977462, 33851515], [4, 53918745, 33756894], [8, 53914649, 33754718]],
+  ts33m: [[0.25, 622453083, 273701518], [0.5, 317741883, 139269536], [1, 168217643, 72765948], [2, 99679566, 41621031], [4, 99546698, 41532479], [8, 99540570, 41531523]]
+};
+// The measured point nearest the current XSPI bandwidth, or null.
+function measured(model, bw) {
+  const m = MEASURED[model];
+  if (!m) return null;
+  return m.reduce((a, b) => (Math.abs(Math.log(b[0] / bw)) < Math.abs(Math.log(a[0] / bw)) ? b : a));
+}
 
 // Side-panel resource list. Every panel view reads this; order is display order.
 const RESOURCES = [
   { id: 'vme', name: () => 'VME', short: () => 'VME', unit: 'ops', rate: 'ops/cyc', color: '#6b98ff' },
   { id: 'rvv', name: () => 'RVV', short: () => 'RVV', unit: 'ops', rate: 'ops/cyc', color: '#4fd1b5' },
   { id: 'dtcm', name: () => 'DTCM ↔ core', short: () => 'DTCM', unit: 'bytes', rate: 'B/cyc', color: '#f5c26b' },
-  { id: 'xfer', name: (HW) => (HW.ext ? 'HyperRAM DMA' : 'Host AXI'), short: (HW) => (HW.ext ? 'DMA' : 'Host'), unit: 'bytes', rate: 'B/cyc', color: '#e07b3c' }
+  { id: 'xfer', name: (HW) => (HW.ext ? 'XSPI DMA' : 'Host AXI'), short: (HW) => (HW.ext ? 'DMA' : 'Host'), unit: 'bytes', rate: 'B/cyc', color: '#e07b3c' }
 ];
 const OVERHEAD = { id: 'overhead', color: '#aab3c0' };
 // vtmms-only loop, operands loaded once (DECODE_GEMV_PROPOSAL): cycles per 16x16x4 step.
@@ -386,7 +400,7 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&
 /* --------------------------------------------------------------- state */
 
 const S = {
-  model: 'neo', hw: 'hyperram', res: 'transposed', phase: 'decode', seq: 1024, layerType: 'global', sel: null,
+  model: 'ts8m', hw: 'xspi', res: 'transposed', phase: 'decode', seq: 1024, layerType: 'global', sel: null,
   p: {}, hwp: {}, whatif: false, zoom: null, fit: 0.9, bars: 'abs', grid: 'achieved', roof: 'xfer'
 };
 
@@ -426,7 +440,7 @@ function resolved() {
     if (S.hwp.dma_overlap !== undefined) HW.dma_overlap = S.hwp.dma_overlap ? 1 : 0;
     HW.host_bw = HW.hb_mhz * HW.hb_bytes / HW.clock_mhz; // B per core cycle
   }
-  BOUNDS.host.label = HW.ext ? 'Memory · HyperRAM' : 'Host transfer';
+  BOUNDS.host.label = HW.ext ? 'Memory · XSPI' : 'Host transfer';
   return { P, HW, BP, BH, L };
 }
 
@@ -520,9 +534,9 @@ function render() {
     ['p', 'vocab', 'Vocab size', 1024, 'LM head width'],
     ['hwp', 'clock_mhz', 'Clock (MHz)', 5, BH.clockConfirmed ? 'confirmed' : 'unconfirmed · not in soc.yaml'],
     ...(HW.ext ? [
-      ['hwp', 'hb_mhz', 'HyperBus clock (MHz)', 5, 'not stated · defaults to core clock'],
-      ['hwp', 'hb_bytes', 'Bytes per bus clock', 1, 'x8 DDR from [10:0] interface · derived'],
-      ['hwp', 'dma_overlap', 'DMA overlaps compute', 'bool', 'not stated · 1 outstanding txn']
+      ['hwp', 'hb_mhz', 'XSPI clock (MHz)', 5, 'not stated · defaults to core clock'],
+      ['hwp', 'hb_bytes', 'Bytes per XSPI clock', 1, '16 bit/cycle · RTL team'],
+      ['hwp', 'dma_overlap', 'DMA overlaps compute', 'bool', 'double-buffered firmware']
     ] : [['hwp', 'host_bw', 'Host→DTCM (B/cycle)', 0.5, 'measured · RTL bound 16']]),
     ['hwp', 'dbus', 'DTCM bus (B/cycle)', 4, 'confirmed · 128-bit LSU'],
     ['hwp', 'dtcm_c', 'DTCM cycles / access', 0.1, 'loads-only loop · 25 cyc / 8 loads'],
@@ -559,7 +573,7 @@ function render() {
       <button type="button" class="btn sm" data-act="whatif" aria-label="Close what-if">✕</button></div>
     <fieldset><legend class="eyebrow">Model · ${esc(BP.file)}</legend>${modelFields}</fieldset>
     <fieldset><legend class="eyebrow">Hardware · ${esc(BH.file)}</legend>${hwFields}</fieldset>
-    <p class="small muted" style="margin:0">Edits override the loaded files for this session. Kernel cycles stay as measured on the VME RTL; the VME step re-costs VME tiles.${HW.ext ? ' HyperRAM bandwidth: ' + (HW.hb_mhz * HW.hb_bytes).toFixed(0) + ' MB/s = ' + HW.host_bw.toFixed(2) + ' B/cycle.' : ''}</p>`;
+    <p class="small muted" style="margin:0">Edits override the loaded files for this session. Kernel cycles stay as measured on the VME RTL; the VME step re-costs VME tiles.${HW.ext ? ' XSPI bandwidth: ' + (HW.hb_mhz * HW.hb_bytes).toFixed(0) + ' MB/s = ' + HW.host_bw.toFixed(2) + ' B/cycle.' : ''}</p>`;
   if (active && active.startsWith('f-') && $(active)) { const el = $(active); el.focus(); }
   $('whatif-btn').setAttribute('aria-pressed', String(S.whatif));
   $('whatif-count').hidden = !changed;
@@ -743,11 +757,14 @@ function render() {
       if (v == null) return '<span class="gc">—</span>';
       return `<span class="gc" style="${violet(Math.min(1, (v - 1) / (maxRatio - 1)))}">×${f3(v)}</span>`;
     };
+    const meas = measured(S.model, HW.host_bw), mt = meas && (S.phase === 'decode' ? meas[2] : meas[1]);
     $('right').innerHTML = `
       <section class="popup grow" aria-label="Model">
         <div class="ph">
-          <div class="ph-top"><span class="ph-big">${base ? f3(base.total) + ' → ' : ''}${f3(cur.total)} cycles${base ? ` <small>×${(cur.total / base.total).toFixed(2)}</small>` : ''}</span><span class="ph-time">${t3(cur.total, HW)}</span></div>
-          <div class="ph-sub">${S.phase === 'decode' ? (hzFmt(hz / cur.total)) + ' tok/s' : 'latency ' + t3(cur.total, HW)}</div>
+          ${meas ? `<div class="ph-top"><span class="ph-big">${f3(mt)} cycles</span><span class="ph-time">${t3(mt, HW)}</span></div>
+          <div class="ph-sub">${S.phase === 'decode' ? hzFmt(hz / mt) + ' tok/s' : '16-token prompt'} · measured on reef-perf at ${meas[0]} B/cycle${meas[0] !== +HW.host_bw.toFixed(2) ? ' (nearest run)' : ''} · kernel estimate ${f3(cur.total)}</div>`
+          : `<div class="ph-top"><span class="ph-big">${base ? f3(base.total) + ' → ' : ''}${f3(cur.total)} cycles${base ? ` <small>×${(cur.total / base.total).toFixed(2)}</small>` : ''}</span><span class="ph-time">${t3(cur.total, HW)}</span></div>
+          <div class="ph-sub">${S.phase === 'decode' ? (hzFmt(hz / cur.total)) + ' tok/s' : 'latency ' + t3(cur.total, HW)}</div>`}
         </div>
         <div class="sec">Time by segment</div>
         ${base

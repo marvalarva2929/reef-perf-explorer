@@ -44,31 +44,26 @@ DTCM access counts are modeled from loop structure; pointwise and attention assu
 The roofline's y axis is used ops over total cycles, the same value as Achieved in
 the table. Its x axis and memory roof follow the DTCM / DMA toggle.
 
-## Hardware configs
+## Hardware config
 
-| Config | Transfer path | Source |
-|---|---|---|
-| `atlas · HyperRAM + DMA` (default) | Weights, KV cache and spilled activations in external HyperRAM; one DMA channel to the Coral core's TCMs, one outstanding transaction | [SoC architecture](https://lhs-soc.vercel.app/architecture) (`soc.yaml`) |
-| `hardware.json · host AXI` | Host writes DTCM over the 128-bit AXI slave at the measured 15.745 B/cycle, no DMA | `simulations/analysis/hardware.json` |
+One config, `reef-perf · XSPI + DMA`: the RTL team's data path. Weights and
+(for now) the KV cache sit in XSPI flash, 16 bit per XSPI clock (~6 ns); one DMA
+channel moves them into the 32 KB DTCM, double buffered so transfers overlap
+compute; the host boots the 8 KB ITCM over SPI. The XSPI clock defaults to the
+50 MHz core clock (2 B/cycle, 100 MB/s); change it under What-if.
 
-The architecture site gives no HyperRAM bandwidth, clock or DMA-overlap rule, so
-these are What-if parameters marked unconfirmed:
-
-- **HyperRAM bandwidth:** the controller's `[10:0]` external interface matches an
-  x8 HyperBus (DQ[7:0], RWDS, CK, CS#), which moves 2 B per bus clock (DDR). The
-  bus clock defaults to the core clock: 100 MB/s, 2 B/cycle at 50 MHz. Per-transaction
-  latency is not modeled.
-- **DMA overlap:** off by default (serialized), since the site lists one outstanding
-  transaction and does not say transfers overlap compute.
-- **Clock:** 50 MHz, an open decision on the site.
-- **16×16 systolic array:** the site's integrated accelerator is assumed to be the
-  same unit as the Coral VME whose RTL cycles the estimate uses.
+The headline (cycles, tok/s) is **measured end to end on reef-perf**
+(`yuvesh-kernel-integration` a660183, M3 core + Zvt matrix engine + DMA + host
+boot) running the `e2e-npu-firmware` branch's firmware
+(`inference-engine/coral/e2e`): 16-token prompt, then decode. It shows the run
+nearest the What-if XSPI bandwidth. The module breakdown below it is still the
+kernel-results estimate.
 
 ## Models
 
 TinyStories-1M, 3M, 8M, 28M and 33M (GPT-Neo: d and layers from the
 roneneldan/TinyStories-* configs, MLP 4·d, vocab 50257, local window 256,
-alternating global/local layers, 16 heads) and GPT-2 small. Only d_head 32 and 64
+alternating global/local layers, 16 heads). Only d_head 32 and 64
 have measured attention streams; other head sizes (TinyStories-1M/3M/8M/33M:
 d_head 4, 8, 16, 48) interpolate between them and are flagged "scaled". Treat
 attention for those models as a rough estimate.
