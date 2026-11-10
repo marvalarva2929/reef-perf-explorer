@@ -52,39 +52,28 @@ channel moves them into the 32 KB DTCM, double buffered so transfers overlap
 compute; the host boots the 8 KB ITCM over SPI. The XSPI clock defaults to the
 50 MHz core clock (2 B/cycle, 100 MB/s); change it under What-if.
 
-The headline (cycles, tok/s) is **measured end to end on reef-perf**
+The cycles and tok/s are **measured end to end on reef-perf**
 (`yuvesh-kernel-integration` a660183, M3 core + Zvt matrix engine + DMA + host
 boot) running the `e2e-npu-firmware` branch's firmware
-(`inference-engine/coral/e2e`): 16-token prompt, then decode. It shows the run
-nearest the What-if XSPI bandwidth. The module breakdown below it is still the
-kernel-results estimate.
+(`inference-engine/coral/e2e`): 16-token prompt, then decode. The module
+breakdown is measured too (see Kernel results).
 
 ## Models
 
-TinyStories-1M, 3M, 8M, 28M and 33M (GPT-Neo: d and layers from the
-roneneldan/TinyStories-* configs, MLP 4·d, vocab 50257, local window 256,
-alternating global/local layers, 16 heads). Only d_head 32 and 64
-have measured attention streams; other head sizes (TinyStories-1M/3M/8M/33M:
-d_head 4, 8, 16, 48) interpolate between them and are flagged "scaled". Treat
-attention for those models as a rough estimate.
+TinyStories-28M and 33M (GPT-Neo: d and layers from the roneneldan/TinyStories-*
+configs, MLP 4·d, vocab 50257, local window 256, alternating global/local
+layers, 16 heads).
 
-## Kernel results sets
+## Kernel results
 
-| Set | Source | GPT-Neo 28M decode @1024 / prefill 1024 (host AXI config) |
-|---|---|---|
-| `sim 376cd28+` (2026-10-20) | `feature/inference-engine-simulation`, RESULTS.md | 0.96 s / 2.37 min |
-| `coral-npu 5fb006c+` (2026-10-21) | `feature/coral-npu-kernels`, RESULTS.md: every integer loop vectorized | 0.76 s / 1.35 min |
-| `stash 4d1a0d9+` (2026-10-22) | unpushed stash on the simulation branch: vectorized pointwise and softmax | 0.75 s / 1.14 min |
-| `coral + transposed` (default) | `coral-npu 5fb006c+` with matmuls at the `reef_perf/rtl_matrix.csv` microbenchmarks, A stored transposed (coralnpu 8a5e1b31): GEMM 16×512×16 = 3,336 cycles, GEMV 1×512×16 = 3,235, 25 cycles per step. Decode matmuls use the VME GEMV tile instead of RVV. Attention keeps its measured streams | |
-
-Cycles are from Coral's `VmeCoreMiniAxi` RTL (cocotb + Verilator, coralnpu
-382b5c12). The `sim 376cd28+` set only logs attention stream totals, so its
-per-block cost is the total spread over 4 blocks (about 1% high). It also has no
-d=512 LayerNorm run, so LayerNorm is scaled from 4×768 and flagged "scaled".
-
-Not measured: the clock (50 MHz, unconfirmed), host-side K-split sums and
-orchestration, contention between host writes and a running kernel. DTCM byte
-counts are derived from loop structure.
+One set, `reef-perf e2e (measured)`: every module's cycles measured end to end
+on reef-perf, with an mcycle read after each kernel. Runs cover XSPI bandwidths
+0.25, 0.5, 1, 2, 4 and 8 B/cycle; prefill is a 16-token prompt (28M in blocks of
+8 tokens, 33M in blocks of 4, to fit the 32 KB DTCM); decode is measured at
+contexts 17, 128, 256, 512, 1024 and 2048. The app shows the run nearest the
+What-if bandwidth and the selected context. Residual adds and GeLU are fused into
+attn_out, fc1 and fc2, so they show 0. The resource columns (VME, RVV, DTCM, DMA
+use) are still modeled from loop structure, not measured.
 
 ## Importing configs
 

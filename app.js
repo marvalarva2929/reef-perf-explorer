@@ -6,54 +6,25 @@
 
 /* ------------------------------------------------------------------ data */
 
-// Kernel results sets. Cycles are mcycle around one kernel call on Coral's
-// VmeCoreMiniAxi RTL (cocotb + Verilator, coralnpu 382b5c12). Attention values
-// are the full stream (4 KV blocks of 64 keys + finish) for one head.
+// Kernel results: one set, measured end to end on reef-perf
+// (yuvesh-kernel-integration a660183: M3 core + Zvt matrix engine + DMA + host
+// boot) running the e2e-npu-firmware branch (inference-engine/coral/e2e), with
+// mcycle read after every kernel. MEASURED_CYCLES (below) gives each module's
+// cycles per model, phase, XSPI bandwidth and decode context; run() charges
+// those. The remaining fields only shape the resource model (ops, DTCM and DMA
+// bytes per module, VME/RVV peaks) and come from the earlier RTL kernel runs.
 const RESULTS = {
-  branch: {
-    label: 'inference-engine-simulation · 376cd28+',
-    short: 'sim 376cd28+',
-    date: '2026-10-20',
-    note: 'PR #16 trim. Scalar pointwise kernels, VME attention with LUT exp.',
-    vmeOverhead: 250, rvvTile: 9315,
-    attn: { 64: { prefill: 358439, decode: 39934 }, 32: { prefill: 259219, decode: 25746 } },
-    layernorm: { 768: 243105 },
-    gelu: 53286, residual: 241941
-  },
-  coral: {
-    label: 'coral-npu-kernels · 5fb006c+',
-    short: 'coral-npu 5fb006c+',
-    date: '2026-10-21',
-    note: 'Every integer loop vectorized on RVV; fixed-point requantization.',
-    vmeOverhead: 251, rvvTile: 9316,
+  reef: {
+    label: 'reef-perf e2e · a660183 · measured',
+    short: 'reef-perf e2e (measured)',
+    date: '2026-11-09',
+    note: 'Every module measured end to end on reef-perf: prefill = 16-token prompt; decode at context 17, 128, 256, 512, 1024, 2048.',
+    vmeOverhead: 136, gemvOverhead: 35, vmeStep: 25, rvvTile: 9316,
     attn: { 64: { prefill: 230527, decode: 31665 }, 32: { prefill: 137562, decode: 17912 } },
     split: { 64: { prefill: [40416.5, 68861], decode: [6827.5, 4355] }, 32: { prefill: [25735.25, 34621], decode: [3922.25, 2223] } },
     layernorm: { 768: 13955, 512: 9534 },
     gelu: 7040, residual: 7594
-  },
-  stash: {
-    label: 'stash on simulation · 4d1a0d9+ (unpushed)',
-    short: 'stash 4d1a0d9+',
-    date: '2026-10-22',
-    note: 'Vectorized pointwise and attention softmax rows, rescale and finish. Lives only in a git stash.',
-    vmeOverhead: 250, rvvTile: 9314,
-    attn: { 64: { prefill: 105359, decode: 23886 }, 32: { prefill: 74087, decode: 13981 } },
-    split: { 64: { prefill: [25255.25, 4338], decode: [5884.5, 348] }, 32: { prefill: [17933.25, 2354], decode: [3439.25, 224] } },
-    layernorm: { 768: 21343, 512: 14367 },
-    gelu: 7029, residual: 17987
   }
-};
-// coral-npu plus the reef_perf matrix microbenchmarks with A stored transposed
-// (contiguous vle8 operand loads, rtl_matrix.csv, coralnpu 8a5e1b31): 25 cycles
-// per step. mtx_gemm_int8 16x512x16 = 3336; mtx_gemv_int8 1x512x16 = 3235.
-// Attention keeps its own measured streams.
-RESULTS.transposed = {
-  ...RESULTS.coral,
-  label: 'coral-npu + transposed VME',
-  short: 'coral + transposed',
-  date: '2026-10-26',
-  note: 'coral-npu with matmuls at the transposed-A VME cycles. Decode matmuls use the VME GEMV tile.',
-  vmeStep: 25, vmeOverhead: 136, gemvOverhead: 35
 };
 
 // Per-tile shapes and traffic (same across result sets; from model.json tiles).
@@ -72,9 +43,6 @@ const tinyStories = (label, d, layers) => ({
   assumed: { n_head: '16 in every TinyStories config' }
 });
 const MODELS = {
-  ts1m: tinyStories('TinyStories-1M', 64, 8),
-  ts3m: tinyStories('TinyStories-3M', 128, 8),
-  ts8m: tinyStories('TinyStories-8M', 256, 8),
   ts28m: tinyStories('TinyStories-28M', 512, 8),
   ts33m: tinyStories('TinyStories-33M', 768, 4)
 };
@@ -90,23 +58,47 @@ const HARDWARE = {
   }
 };
 
-// Measured end to end on reef-perf (yuvesh-kernel-integration a660183: M3 core,
-// Zvt matrix engine, DMA, host boot) with the e2e-npu-firmware branch
-// (inference-engine/coral/e2e): the whole model streamed from XSPI, 16-token
-// prompt, 2 new tokens. [XSPI bytes per core cycle, prefill cycles (16-token
-// prompt + first token), decode cycles per token]. Cycle counts only.
-const MEASURED = {
-  ts1m: [[0.25, 16266085, 16518735], [0.5, 8582021, 8834159], [1, 4802093, 5055127], [2, 3282651, 3527437], [4, 3230142, 3472328], [8, 3229758, 3472056]],
-  ts3m: [[0.25, 34329182, 34614552], [0.5, 17829134, 18105104], [1, 9783022, 10044400], [2, 6322293, 6530055], [4, 6268661, 6466671], [8, 6267893, 6466127]],
-  ts8m: [[0.25, 80015810, 80368092], [0.5, 41168346, 41493060], [1, 22236695, 22515841], [2, 13863551, 13883441], [4, 13809168, 13809706], [8, 13807632, 13808618]],
-  ts28m: [[0.25, 313936053, 209938970], [0.5, 161003242, 107469119], [1, 86542570, 57206647], [2, 53977462, 33851515], [4, 53918745, 33756894], [8, 53914649, 33754718]],
-  ts33m: [[0.25, 622453083, 273701518], [0.5, 317741883, 139269536], [1, 168217643, 72765948], [2, 99679566, 41621031], [4, 99546698, 41532479], [8, 99540570, 41531523]]
+// Module cycles measured on reef-perf (see RESULTS). MEASURED_CYCLES[model] =
+// { order, prefill: { bw: [cycles in order] }, decode: { bw: { ctx: [...] } } }.
+// Prefill is a 16-token prompt; bw is XSPI bytes per core cycle. Residual
+// adds and GeLU run inside attn_out, fc1 and fc2, so they are 0.
+const MEASURED_CYCLES = {
+  ts28m: {
+    order: ['ln1',  'qkv',  'attention_global',  'attention_local',  'attn_out',  'ln2',  'fc1',  'fc2',  'ln_f',  'lm_head',  'embedding'],
+    prefill: { 0.25: [86972,  6419012,  317740,  325940,  2142098,  86952,  8539804,  8520158,  43553,  104877942,  81162], 0.5: [86972,  3266114,  248108,  256308,  1103228,  86952,  4357448,  4340666,  43553,  52965771,  48394], 1: [86972,  1764020,  235578,  243778,  607612,  86952,  2374984,  2272186,  43553,  27010955,  32010], 2: [86972,  1127006,  234554,  242754,  395274,  86952,  1527322,  1394476,  43553,  15124450,  23818], 4: [86972,  1127006,  234042,  242242,  395274,  86952,  1527322,  1394476,  43553,  15075497,  19722], 8: [86972,  1127006,  233786,  241986,  395274,  86952,  1527322,  1394476,  43553,  15075497,  17674] },
+    decode: {
+      0.25: { 17: [43486,  3207762,  227062,  235258,  1070953,  43476,  4269806,  4259983,  43549,  104877942,  5136], 128: [43483,  3204104,  639667,  672439,  1069755,  43476,  4264131,  4254306,  43480,  104680519,  5054], 256: [43483,  3204104,  1189539,  1255111,  1069755,  43476,  4264131,  4254306,  43480,  104680519,  5054], 512: [43483,  3204104,  2289155,  1255113,  1069755,  43476,  4264131,  4254306,  43480,  104680519,  5054], 1024: [43483,  3204104,  4488291,  1255113,  1069755,  43476,  4264131,  4254306,  43480,  104680519,  5054], 2048: [43483,  3204104,  8885859,  1255113,  1069755,  43476,  4264131,  4254306,  43480,  104680519,  5054] },
+      0.5: { 17: [43486,  1629969,  190198,  198394,  550846,  43476,  2175652,  2169565,  43549,  52965771,  3088], 128: [43483,  1625833,  602803,  635575,  549408,  43476,  2169054,  2163660,  43480,  52768350,  3006], 256: [43483,  1625833,  1152675,  1218247,  549408,  43476,  2169054,  2163660,  43480,  52768350,  3006], 512: [43483,  1625833,  2252291,  1218249,  549408,  43476,  2169054,  2163660,  43480,  52768350,  3006], 1024: [43483,  1625833,  4451427,  1218249,  549408,  43476,  2169054,  2163660,  43480,  52768350,  3006], 2048: [43483,  1625833,  8848995,  1218249,  549408,  43476,  2169054,  2163660,  43480,  52768350,  3006] },
+      1: { 17: [43486,  872209,  182909,  191105,  303038,  43476,  1184420,  1135325,  43549,  27010955,  2064], 128: [43483,  868073,  595514,  628286,  301600,  43476,  1177822,  1129420,  43480,  26813534,  1982], 256: [43483,  868073,  1145386,  1210958,  301600,  43476,  1177822,  1129420,  43480,  26813534,  1982], 512: [43483,  868073,  2245002,  1210960,  301600,  43476,  1177822,  1129420,  43480,  26813534,  1982], 1024: [43483,  868073,  4444138,  1210960,  301600,  43476,  1177822,  1129420,  43480,  26813534,  1982], 2048: [43483,  868073,  8841706,  1210960,  301600,  43476,  1177822,  1129420,  43480,  26813534,  1982] },
+      2: { 17: [43486,  516617,  181885,  190081,  185891,  43476,  716641,  648610,  43549,  15124450,  1552], 128: [43483,  513381,  594490,  627262,  184976,  43476,  712950,  645760,  43480,  15052396,  1470], 256: [43483,  513381,  1144362,  1209934,  184976,  43476,  712950,  645760,  43480,  15052396,  1470], 512: [43483,  513381,  2243978,  1209936,  184976,  43476,  712950,  645760,  43480,  15052396,  1470], 1024: [43483,  513381,  4443114,  1209936,  184976,  43476,  712950,  645760,  43480,  15052396,  1470], 2048: [43483,  513381,  8840682,  1209936,  184976,  43476,  712950,  645760,  43480,  15052396,  1470] },
+      4: { 17: [43486,  514991,  181373,  189569,  185349,  43476,  714509,  648086,  43549,  15075497,  1296], 128: [43483,  511839,  593978,  626750,  184462,  43476,  711006,  645278,  43480,  15011847,  1214], 256: [43483,  511839,  1143850,  1209422,  184462,  43476,  711006,  645278,  43480,  15011847,  1214], 512: [43483,  511839,  2243466,  1209424,  184462,  43476,  711006,  645278,  43480,  15011847,  1214], 1024: [43483,  511839,  4442602,  1209424,  184462,  43476,  711006,  645278,  43480,  15011847,  1214], 2048: [43483,  511839,  8840170,  1209424,  184462,  43476,  711006,  645278,  43480,  15011847,  1214] },
+      8: { 17: [43486,  514991,  181117,  189313,  185349,  43476,  714509,  648086,  43549,  15075497,  1168], 128: [43483,  511839,  593722,  626494,  184462,  43476,  711006,  645278,  43480,  15011847,  1086], 256: [43483,  511839,  1143594,  1209166,  184462,  43476,  711006,  645278,  43480,  15011847,  1086], 512: [43483,  511839,  2243210,  1209168,  184462,  43476,  711006,  645278,  43480,  15011847,  1086], 1024: [43483,  511839,  4442346,  1209168,  184462,  43476,  711006,  645278,  43480,  15011847,  1086], 2048: [43483,  511839,  8839914,  1209168,  184462,  43476,  711006,  645278,  43480,  15011847,  1086] }
+    }
+  },
+  ts33m: {
+    order: ['ln1',  'qkv',  'attention_global',  'attention_local',  'attn_out',  'ln2',  'fc1',  'fc2',  'ln_f',  'lm_head',  'embedding'],
+    prefill: { 0.25: [257428,  28755240,  877096,  893496,  9590944,  257364,  38317272,  38270440,  64418,  156935240,  118778], 0.5: [257428,  14591288,  668200,  684600,  4905448,  257364,  19466880,  19429256,  64418,  79269960,  69626], 1: [257428,  7683728,  626308,  642708,  2632168,  257364,  10373760,  10078088,  64418,  40437320,  45050], 2: [257428,  4537148,  623236,  639636,  1583308,  257364,  6186348,  5783468,  64418,  22500656,  32762], 4: [257428,  4530728,  621700,  638100,  1581168,  257364,  6178012,  5781432,  64418,  22450582,  26618], 8: [257428,  4530728,  620936,  637336,  1581168,  257364,  6178012,  5781432,  64418,  22450582,  23546] },
+    decode: {
+      0.25: { 17: [64357,  7188090,  309051,  315852,  2397704,  64341,  9579286,  9567578,  64414,  156935040,  7490], 128: [64346,  7179074,  911630,  917862,  2394718,  64341,  9565172,  9553457,  64346,  156628259,  7432], 256: [64346,  7179074,  1714959,  1721222,  2394718,  64341,  9565172,  9553457,  64346,  156628259,  7432], 512: [64346,  7179074,  3321614,  1721223,  2394718,  64341,  9565172,  9553457,  64346,  156628259,  7432], 1024: [64346,  7179074,  6534926,  1721223,  2394718,  64341,  9565172,  9553457,  64346,  156628259,  7432], 2048: [64346,  7179074,  12961550,  1721223,  2394718,  64341,  9565172,  9553457,  64346,  156628259,  7432] },
+      0.5: { 17: [64357,  3646398,  255432,  263628,  1225978,  64341,  4865184,  4856930,  64414,  79269760,  4418], 128: [64346,  3636752,  794337,  827110,  1222677,  64341,  4850096,  4842516,  64346,  78962979,  4360], 256: [64346,  3636752,  1513489,  1579062,  1222677,  64341,  4850096,  4842516,  64346,  78962979,  4360], 512: [64346,  3636752,  2951665,  1579063,  1222677,  64341,  4850096,  4842516,  64346,  78962979,  4360], 1024: [64346,  3636752,  5827921,  1579063,  1222677,  64341,  4850096,  4842516,  64346,  78962979,  4360], 2048: [64346,  3636752,  11579729,  1579063,  1222677,  64341,  4850096,  4842516,  64346,  78962979,  4360] },
+      1: { 17: [64357,  1918910,  244959,  253155,  657658,  64341,  2591904,  2519138,  64414,  40437120,  2882], 128: [64346,  1909264,  783864,  816637,  654357,  64341,  2576816,  2504724,  64346,  40130339,  2824], 256: [64346,  1909264,  1503016,  1568589,  654357,  64341,  2576816,  2504724,  64346,  40130339,  2824], 512: [64346,  1909264,  2941192,  1568590,  654357,  64341,  2576816,  2504724,  64346,  40130339,  2824], 1024: [64346,  1909264,  5817448,  1568590,  654357,  64341,  2576816,  2504724,  64346,  40130339,  2824], 2048: [64346,  1909264,  11569256,  1568590,  654357,  64341,  2576816,  2504724,  64346,  40130339,  2824] },
+      2: { 17: [64357,  1100303,  244191,  252387,  386995,  64341,  1511259,  1409387,  64414,  22355840,  2114], 128: [64346,  1097764,  783096,  815869,  386399,  64341,  1509086,  1408770,  64346,  22338351,  2056], 256: [64346,  1097764,  1502248,  1567821,  386399,  64341,  1509086,  1408770,  64346,  22338351,  2056], 512: [64346,  1097764,  2940424,  1567822,  386399,  64341,  1509086,  1408770,  64346,  22338351,  2056], 1024: [64346,  1097764,  5816680,  1567822,  386399,  64341,  1509086,  1408770,  64346,  22338351,  2056], 2048: [64346,  1097764,  11568488,  1567822,  386399,  64341,  1509086,  1408770,  64346,  22338351,  2056] },
+      4: { 17: [64357,  1097546,  243807,  252003,  386076,  64341,  1507639,  1408494,  64414,  22299478,  1730], 128: [64346,  1095355,  782712,  815485,  385596,  64341,  1506045,  1408015,  64346,  22294762,  1672], 256: [64346,  1095355,  1501864,  1567437,  385596,  64341,  1506045,  1408015,  64346,  22294762,  1672], 512: [64346,  1095355,  2940040,  1567438,  385596,  64341,  1506045,  1408015,  64346,  22294762,  1672], 1024: [64346,  1095355,  5816296,  1567438,  385596,  64341,  1506045,  1408015,  64346,  22294762,  1672], 2048: [64346,  1095355,  11568104,  1567438,  385596,  64341,  1506045,  1408015,  64346,  22294762,  1672] },
+      8: { 17: [64357,  1097546,  243616,  251812,  386076,  64341,  1507639,  1408494,  64414,  22299478,  1538], 128: [64346,  1095355,  782520,  815293,  385596,  64341,  1506045,  1408015,  64346,  22294762,  1480], 256: [64346,  1095355,  1501672,  1567245,  385596,  64341,  1506045,  1408015,  64346,  22294762,  1480], 512: [64346,  1095355,  2939848,  1567246,  385596,  64341,  1506045,  1408015,  64346,  22294762,  1480], 1024: [64346,  1095355,  5816104,  1567246,  385596,  64341,  1506045,  1408015,  64346,  22294762,  1480], 2048: [64346,  1095355,  11567912,  1567246,  385596,  64341,  1506045,  1408015,  64346,  22294762,  1480] }
+    }
+  }
 };
-// The measured point nearest the current XSPI bandwidth, or null.
-function measured(model, bw) {
-  const m = MEASURED[model];
+const nearest = (keys, v) => keys.map(Number).reduce((a, b) => (Math.abs(Math.log(b / v)) < Math.abs(Math.log(a / v)) ? b : a));
+// The measured run nearest this XSPI bandwidth and context, or null.
+function measuredRun(model, phase, bw, ctx) {
+  const m = MEASURED_CYCLES[model];
   if (!m) return null;
-  return m.reduce((a, b) => (Math.abs(Math.log(b[0] / bw)) < Math.abs(Math.log(a[0] / bw)) ? b : a));
+  const b = nearest(Object.keys(m[phase]), bw);
+  let row = m[phase][b], c = 16;
+  if (phase === 'decode') { c = nearest(Object.keys(row), ctx); row = row[c]; }
+  const out = { bw: b, ctx: c };
+  m.order.forEach((k, i) => { out[k] = row[i]; });
+  return out;
 }
 
 // Side-panel resource list. Every panel view reads this; order is display order.
@@ -321,16 +313,21 @@ function run(P, HW, L, nq, ctx) {
   // outputs go out over the transfer path: host AXI writes, or the HyperRAM
   // DMA. Serialized with the kernel unless the DMA is set to overlap.
   const overlap = HW.ext && HW.dma_overlap;
-  const cost = (o) => {
+  const meas = measuredRun(S.model, nq > 1 ? 'prefill' : 'decode', HW.host_bw, ctx);
+  const key = (o, t) => (o.id === 'attention' ? 'attention_' + t : o.id);
+  const cost = (o, t) => {
     o.hc = o.host / HW.host_bw;
-    o.tc = overlap ? Math.max(o.kc, o.hc) : o.kc + o.hc;
+    // Measured: the module's whole time, DMA included (it overlaps compute).
+    if (meas) o.kc = meas[key(o, t)] || 0;
+    o.tc = meas ? o.kc : overlap ? Math.max(o.kc, o.hc) : o.kc + o.hc;
     classify(o, HW, L);
     o.m = moduleData(o, HW, L, overlap);
   };
   let total = 0, kern = 0, moved = 0;
-  for (const t of ['global', 'local']) for (const o of res[t]) { cost(o); total += counts[t] * o.tc; kern += counts[t] * o.kc; moved += counts[t] * o.host; }
+  for (const t of ['global', 'local']) for (const o of res[t]) { cost(o, t); total += counts[t] * o.tc; kern += counts[t] * o.kc; moved += counts[t] * o.host; }
   for (const o of head) { cost(o); total += o.tc; kern += o.kc; moved += o.host; }
-  return { res, head, counts, total, kern, moved };
+  if (meas) total += meas.embedding;
+  return { res, head, counts, total, kern, moved, meas };
 }
 
 /* -------------------------------------------------------------- format */
@@ -400,7 +397,7 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&
 /* --------------------------------------------------------------- state */
 
 const S = {
-  model: 'ts8m', hw: 'xspi', res: 'transposed', phase: 'decode', seq: 1024, layerType: 'global', sel: null,
+  model: 'ts28m', hw: 'xspi', res: 'reef', phase: 'decode', seq: 1024, layerType: 'global', sel: null,
   p: {}, hwp: {}, whatif: false, zoom: null, fit: 0.9, bars: 'abs', grid: 'achieved', roof: 'xfer'
 };
 
@@ -611,7 +608,7 @@ function render() {
     <div class="abs row-label" style="left:264px;top:576px">Output head · once per step</div>
     <svg class="abs" width="1500" height="820" viewBox="0 0 1500 820" aria-hidden="true" style="left:0;top:0"><path d="${edgePath()}" fill="none" stroke="#98a2b1" stroke-width="1.6" stroke-linejoin="round"/></svg>
     <div class="abs endpoint" style="left:40px;top:120px;width:150px">${S.phase === 'prefill' ? 'tokens in · ' + seq : 'token in · ctx ' + seq}</div>
-    <div class="abs ghost-node"><span class="mono" style="font-weight:600;font-size:14px">embedding</span><span class="small muted">host gather</span><span class="small muted">not modeled</span></div>
+    <div class="abs ghost-node"><span class="mono" style="font-weight:600;font-size:14px">embedding</span><span class="small muted">DMA gather</span><span class="small muted">${cur.meas ? f3(cur.meas.embedding) + ' cycles' : 'not modeled'}</span></div>
     <div class="abs endpoint" style="left:744px;top:654px;width:180px">logits · ${P.vocab}</div>
     ${nodes}`;
 
@@ -757,14 +754,11 @@ function render() {
       if (v == null) return '<span class="gc">—</span>';
       return `<span class="gc" style="${violet(Math.min(1, (v - 1) / (maxRatio - 1)))}">×${f3(v)}</span>`;
     };
-    const meas = measured(S.model, HW.host_bw), mt = meas && (S.phase === 'decode' ? meas[2] : meas[1]);
     $('right').innerHTML = `
       <section class="popup grow" aria-label="Model">
         <div class="ph">
-          ${meas ? `<div class="ph-top"><span class="ph-big">${f3(mt)} cycles</span><span class="ph-time">${t3(mt, HW)}</span></div>
-          <div class="ph-sub">${S.phase === 'decode' ? hzFmt(hz / mt) + ' tok/s' : '16-token prompt'} · measured on reef-perf at ${meas[0]} B/cycle${meas[0] !== +HW.host_bw.toFixed(2) ? ' (nearest run)' : ''} · kernel estimate ${f3(cur.total)}</div>`
-          : `<div class="ph-top"><span class="ph-big">${base ? f3(base.total) + ' → ' : ''}${f3(cur.total)} cycles${base ? ` <small>×${(cur.total / base.total).toFixed(2)}</small>` : ''}</span><span class="ph-time">${t3(cur.total, HW)}</span></div>
-          <div class="ph-sub">${S.phase === 'decode' ? (hzFmt(hz / cur.total)) + ' tok/s' : 'latency ' + t3(cur.total, HW)}</div>`}
+          <div class="ph-top"><span class="ph-big">${base ? f3(base.total) + ' → ' : ''}${f3(cur.total)} cycles${base ? ` <small>×${(cur.total / base.total).toFixed(2)}</small>` : ''}</span><span class="ph-time">${t3(cur.total, HW)}</span></div>
+          <div class="ph-sub">${S.phase === 'decode' ? (hzFmt(hz / cur.total)) + ' tok/s' : 'latency ' + t3(cur.total, HW)}${cur.meas ? ` · measured: ${S.phase === 'decode' ? 'context ' + cur.meas.ctx : cur.meas.ctx + '-token prompt'}, ${cur.meas.bw} B/cycle` : ''}</div>
         </div>
         <div class="sec">Time by segment</div>
         ${base
