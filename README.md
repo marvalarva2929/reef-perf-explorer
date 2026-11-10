@@ -54,22 +54,21 @@ compute; the host boots the 8 KB ITCM over SPI. The XSPI clock defaults to the
 
 The cycles and tok/s are **measured end to end on reef-perf**
 (`yuvesh-kernel-integration` a660183, M3 core + Zvt matrix engine + DMA + host
-boot) running the `e2e-npu-firmware` branch's firmware
+boot) running the firmware from [reef PR #57](https://github.com/LonghornSilicon/reef/pull/57)
 (`inference-engine/coral/e2e`): 16-token prompt, then decode. The module
 breakdown is measured too (see Kernel results).
 
 ## Models
 
-TinyStories-28M and 33M (GPT-Neo: d and layers from the roneneldan/TinyStories-*
-configs, MLP 4·d, vocab 50257, local window 256, alternating global/local
-layers, 16 heads).
+TinyStories-28M (GPT-Neo: d 512, 8 layers, 16 heads of 32, MLP 2048, vocab
+50257, local window 256, alternating global/local layers).
 
 ## Kernel results
 
 One set, `reef-perf e2e (measured)`: every module's cycles measured end to end
 on reef-perf, with an mcycle read after each kernel. Runs cover XSPI bandwidths
-0.25, 0.5, 1, 2, 4 and 8 B/cycle; prefill is a 16-token prompt (28M in blocks of
-8 tokens, 33M in blocks of 4, to fit the 32 KB DTCM); decode is measured at
+0.25, 0.5, 1, 2, 4 and 8 B/cycle; prefill is a 16-token prompt (in blocks of 8 tokens,
+to fit the 32 KB DTCM); decode is measured at
 contexts 17, 128, 256, 512, 1024 and 2048. The app shows the run nearest the
 What-if bandwidth and the selected context. Residual adds and GeLU are fused into
 attn_out, fc1 and fc2, so they show 0. The resource columns (VME, RVV, DTCM, DMA
