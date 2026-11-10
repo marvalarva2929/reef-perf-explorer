@@ -473,7 +473,10 @@ function render() {
   // ---- ranking
   const order = ['ln1', 'qkv', 'attention', 'attn_out', 'residual1', 'ln2', 'fc1', 'gelu', 'fc2', 'residual2'];
   const rows = [];
+  // In the measured firmware these run inside another module's epilogue.
+  const fused = cur.meas ? { residual1: 'attn_out', gelu: 'fc1', residual2: 'fc2' } : {};
   order.forEach((id, i) => {
+    if (fused[id]) return;
     if (id === 'attention') {
       for (const t of ['global', 'local']) {
         const c = cur.counts[t];
@@ -565,6 +568,11 @@ function render() {
 
   // ---- canvas world
   const nodeHTML = (o, x, y, n) => {
+    if (fused[o.id]) {
+      return `<button type="button" class="node" style="left:${x}px;top:${y}px" disabled aria-label="${o.id}, fused into ${fused[o.id]}">
+      <span class="strip" style="background:var(--line)"></span>
+      <span class="body"><span class="id">${o.id}</span><span class="kind">fused into ${fused[o.id]}</span></span></button>`;
+    }
     const share = (o.tc * n) / cur.total;
     const B = BOUNDS[o.bound];
     return `<button type="button" class="node" style="left:${x}px;top:${y}px" data-sel="${o.id}" aria-pressed="${sel === o.id}"
@@ -669,6 +677,7 @@ function render() {
     // Modules within a few px share one dot; rows are sorted, so the first is the largest.
     const groups = [];
     for (const r of rows) {
+      if (!(r.o.m.total_cycles > 0)) continue;
       const m = r.o.m, eng = r.o.engine === 'VME' ? 'vme' : 'rvv';
       const ops = m.used[eng], x = ops / m.used[mem.id], y = ops / m.total_cycles;
       const px = X(x), py = Y(y), on = !!sel && r.key === sel && (!r.t || r.t === lt);
